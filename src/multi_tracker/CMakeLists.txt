@@ -20,6 +20,7 @@ find_package(Eigen3 REQUIRED)
 find_package(image_transport REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
+find_package(vision_msgs REQUIRED)
 
 # include 디렉토리 설정
 include_directories(
@@ -43,6 +44,7 @@ ament_target_dependencies(multi_tracker_node
   image_transport
   tf2
   tf2_geometry_msgs
+  vision_msgs
 )
 # 런치 설정
 install(TARGETS multi_tracker_node

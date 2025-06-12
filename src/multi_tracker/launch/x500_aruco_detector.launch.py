@@ -11,6 +11,7 @@ def generate_launch_description():
         DeclareLaunchArgument('target_id_topic', default_value='/x500/target_id'),
         DeclareLaunchArgument('image_proc_topic', default_value='/x500/image_proc'),
         DeclareLaunchArgument('target_pose_topic', default_value='/x500/target_pose'),
+        DeclareLaunchArgument('marker_world_pose_topic', default_value='/x500/marker_world_pose'),
 
         Node(
             package='multi_tracker',
@@ -23,7 +24,8 @@ def generate_launch_description():
                 'camera_info_topic': LaunchConfiguration('camera_info_topic'),
                 'target_id_topic': LaunchConfiguration('target_id_topic'),
                 'image_proc_topic': LaunchConfiguration('image_proc_topic'),
-                'target_pose_topic': LaunchConfiguration('target_pose_topic')
+                'target_pose_topic': LaunchConfiguration('target_pose_topic'),
+                'marker_world_pose_topic': LaunchConfiguration('marker_world_pose_topic')
             }]
         )
     ])
