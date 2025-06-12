@@ -9,7 +9,8 @@ def generate_launch_description():
             package='gazebo_env_setup',
             executable='pose_tf_broadcaster',
             name='pose_tf_broadcaster',
-            output='screen'
+            output='screen',
+            parameters=[{'use_sim_time': True}]
         ),
 
         # Static TF: base_link → camera_front

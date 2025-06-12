@@ -7,6 +7,7 @@
 #include "geometry_msgs/msg/pose_stamped.hpp"
 #include "nav_msgs/msg/odometry.hpp"
 #include "visualization_msgs/msg/marker.hpp"
+#include "std_msgs/msg/string.hpp"
 
 #include <fstream>
 #include <sstream>
@@ -47,6 +48,7 @@ public:
     get_parameter("longitudinal_speed", max_speed_);
 
     cmd_pub_ = create_publisher<geometry_msgs::msg::Twist>("/model/X1_asp/cmd_vel", 10);
+    state_pub_ = create_publisher<std_msgs::msg::String>("/vehicle/state", 10);
     navsat_sub_ = create_subscription<sensor_msgs::msg::NavSatFix>(
       "/world/default/model/X1_asp/link/base_link/sensor/navsat_sensor/navsat", 10,
       std::bind(&PathFollower::navsat_callback, this, _1));
@@ -144,8 +146,12 @@ private:
     }
 
   void control_loop() {
+    // 상태 발행을 위한 메시지
+    std_msgs::msg::String state_msg;
+
     if (!origin_set_ || !navsat_received_ || !pose_received_ || path_.empty()) 
     {
+        vehicle_state_ = "WAITING_FOR_SENSORS";
         if(!origin_set_) {
             RCLCPP_WARN(get_logger(), "Origin not set yet.");
         }
@@ -158,9 +164,12 @@ private:
         if(path_.empty()) {
             RCLCPP_WARN(get_logger(), "Path not loaded yet.");
         }
+        state_msg.data = vehicle_state_;
+        state_pub_->publish(state_msg);
         return;
     }
     if (!path_localized_ && origin_set_ && pose_received_ && !path_.empty()) {
+        vehicle_state_ = "LOCALIZING_PATH";
         for (auto &[px, py] : path_) 
         {
             double gx = current_x_ + std::cos(current_yaw_)*px - std::sin(current_yaw_)*py;
@@ -172,7 +181,13 @@ private:
         // 초기 목표 인덱스 그대로 0
     }
 
-    if (!path_localized_) return;   // 아직 변환 전이면 대기
+    if (!path_localized_) {
+        state_msg.data = vehicle_state_;
+        state_pub_->publish(state_msg);
+        return;   // 아직 변환 전이면 대기
+    }
+    
+    vehicle_state_ = "FOLLOWING_PATH";
 
     // 현재 추종할 월드-목표
     double goal_x = path_world_[current_target_index_].first;
@@ -203,8 +218,13 @@ private:
     cmd_pub_->publish(cmd);
 
     // 목표 도달 판정(0.5 m) → 다음 포인트
-    if (dist < 0.5 && current_target_index_+1 < path_world_.size())
-        ++current_target_index_;
+    if (dist < 0.5) {
+        if (current_target_index_ + 1 < path_world_.size()) {
+            ++current_target_index_;
+        } else {
+            vehicle_state_ = "GOAL_REACHED";
+        }
+    }
 
     // [1] 현재 위치 퍼블리시 (current_pose)
     geometry_msgs::msg::PoseStamped pose_msg;
@@ -239,6 +259,9 @@ private:
     marker.lifetime = rclcpp::Duration::from_seconds(0.2);
     marker_pub_->publish(marker);
 
+    // [3] 현재 상태 퍼블리시
+    state_msg.data = vehicle_state_;
+    state_pub_->publish(state_msg);
   }
 
     std::string path_file_;
@@ -248,8 +271,10 @@ private:
     double current_x_{0.0}, current_y_{0.0}, current_z_{0.0}, current_yaw_{0.0};
     std::vector<std::pair<double,double>> path_world_;
     bool path_localized_{false};
+    std::string vehicle_state_{"INITIALIZING"};
 
     rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_pub_;
+    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr state_pub_;
     rclcpp::Subscription<sensor_msgs::msg::NavSatFix>::SharedPtr navsat_sub_;
     rclcpp::Subscription<geometry_msgs::msg::Pose>::SharedPtr pose_sub_;
     rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr pose_pub_;
