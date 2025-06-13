@@ -6,7 +6,7 @@ from rclpy.parameter import Parameter
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 
 # --- 메시지 타입 임포트 ---
-from px4_msgs.msg import OffboardControlMode, TrajectorySetpoint, VehicleCommand, VehicleLocalPosition
+from px4_msgs.msg import OffboardControlMode, TrajectorySetpoint, VehicleCommand, VehicleLocalPosition, VehicleLandDetected, VehicleAttitude, GimbalDeviceAttitudeStatus
 from geometry_msgs.msg import PoseStamped
 from std_msgs.msg import String
 
@@ -41,6 +41,15 @@ class InteractiveMissionNode(Node):
         self.local_position_subscriber = self.create_subscription(
             VehicleLocalPosition, "/fmu/out/vehicle_local_position", self.local_position_callback, qos_profile
         )
+        self.land_detected_subscriber = self.create_subscription(
+            VehicleLandDetected, "/fmu/out/vehicle_land_detected", self.land_detected_callback, qos_profile
+        )
+        self.attitude_subscriber = self.create_subscription(
+            VehicleAttitude, "/fmu/out/vehicle_attitude", self.attitude_callback, qos_profile
+        )
+        self.gimbal_status_subscriber = self.create_subscription(
+            GimbalDeviceAttitudeStatus, "/fmu/out/gimbal_device_attitude_status", self.gimbal_status_callback, qos_profile
+        )
 
         # --- TF2 리스너 ---
         self.tf_buffer = Buffer()
@@ -50,6 +59,8 @@ class InteractiveMissionNode(Node):
         self.state = "INIT"
         self.current_map_pose = None
         self.current_local_pos = None
+        self.land_detected = None
+        self.current_attitude = None
         self.target_pose_map = PoseStamped()
         self.target_pose_map.header.frame_id = 'map'
         self.takeoff_altitude = 10.0
@@ -58,6 +69,11 @@ class InteractiveMissionNode(Node):
         self.handshake_counter = 0
         self.handshake_duration = 15
         self.drone_frame_id = "x500_gimbal_0/base_link"
+
+        # --- 기준 GPS 좌표 ---
+        self.ref_lat = 0.0
+        self.ref_lon = 0.0
+        self.ref_alt = 0.0
 
         # --- 목적지 좌표 (ENU) ---
         self.waypoints = [
@@ -69,7 +85,7 @@ class InteractiveMissionNode(Node):
             [-109.1330, 100.3533, 23.1363]   # 5번
         ]
         self.final_destination = [-62.9630, 99.0915, 0.1349] # 'final' 목적지
-
+        
         # --- 사용자 입력을 위한 스레드 ---
         self.input_thread = threading.Thread(target=self.command_input_loop)
         self.input_thread.daemon = True
@@ -93,9 +109,10 @@ class InteractiveMissionNode(Node):
         print("    descend <meters>         - 지정한 미터만큼 상대 고도 하강")
         print("    maintain <altitude>      - 지정한 절대 고도로 이동/유지")
         print("  [짐벌 제어]")
-        print("    gimbal_angle <pitch> [yaw] - 짐벌 각도 조작 (예: gimbal_angle -90 0)")
-        print("    gimbal_reset             - 짐벌 정면으로 초기화")
-        print("    gimbal_down              - 짐벌 수직 아래로")
+        print("    look <0-5>               - (GPS 변환) 지정 마커를 바라봄")
+        print("    look_enu <0-5>           - (ENU 직접 계산) 지정 마커를 바라봄 [디버깅용]")
+        print("    look front               - 짐벌 정면으로 초기화")
+        print("    look down                - 짐벌 수직 아래로")
         print("-----------------------------")
 
         for line in sys.stdin:
@@ -105,7 +122,6 @@ class InteractiveMissionNode(Node):
 
             command = cmd[0].lower()
             
-            # --- 명령어 처리 로직 ---
             if command == "takeoff":
                 if self.state == "ARMED_IDLE":
                     self.get_logger().info("User command: TAKEOFF")
@@ -123,8 +139,8 @@ class InteractiveMissionNode(Node):
             elif command == "arm":
                 if self.state == "LANDED":
                     self.get_logger().info("User command: ARM. Re-arming the drone.")
-                    self.publish_vehicle_command(VehicleCommand.VEHICLE_CMD_DO_SET_MODE, param1=1.0, param2=6.0) # Offboard 모드 재설정
-                    self.publish_vehicle_command(VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM, param1=1.0) # Arm
+                    self.publish_vehicle_command(VehicleCommand.VEHICLE_CMD_DO_SET_MODE, param1=1.0, param2=6.0)
+                    self.publish_vehicle_command(VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM, param1=1.0)
                     self.state = "ARMED_IDLE"
                 else:
                      self.get_logger().warn(f"Can only arm when LANDED. Current state: {self.state}")
@@ -132,8 +148,11 @@ class InteractiveMissionNode(Node):
             elif command == "stop":
                 if self.state in ["IDLE", "MOVING", "TAKING_OFF"]:
                     self.get_logger().info("User command: STOP. Halting movement and hovering.")
-                    self.target_pose_map = copy.deepcopy(self.current_map_pose) # 현재 위치를 목표로 설정
-                    self.state = "IDLE"
+                    if self.current_map_pose:
+                        self.target_pose_map = copy.deepcopy(self.current_map_pose)
+                        self.state = "IDLE"
+                    else:
+                        self.get_logger().warn("Cannot stop, current pose not available.")
                 else:
                     self.get_logger().warn(f"Cannot stop from state: {self.state}")
 
@@ -141,7 +160,7 @@ class InteractiveMissionNode(Node):
                 target = cmd[1].lower()
                 try:
                     if self.state not in ["IDLE", "MOVING"]:
-                        self.get_logger().warn(f"Cannot execute '{command}' in state: {self.state}. Must be flying (IDLE or MOVING).")
+                        self.get_logger().warn(f"Cannot execute '{command}' in state: {self.state}. Must be flying.")
                         continue
 
                     if target == "final":
@@ -165,89 +184,99 @@ class InteractiveMissionNode(Node):
                     self.state = "MOVING"
 
                 except (ValueError, IndexError):
-                    self.get_logger().error(f"Invalid '{command}' command. Waypoint index must be 0-{len(self.waypoints)-1} or 'final'")
+                    self.get_logger().error(f"Invalid waypoint index. Use 0-{len(self.waypoints)-1} or 'final'")
 
             elif command in ["climb", "descend"] and len(cmd) > 1:
                 try:
                     if self.state not in ["IDLE", "MOVING"]:
-                        self.get_logger().warn(f"Cannot change altitude in state: {self.state}. Must be flying (IDLE or MOVING).")
+                        self.get_logger().warn(f"Cannot change altitude in state: {self.state}. Must be flying.")
                         continue
 
                     alt_change = float(cmd[1])
-                    if command == "descend":
-                        alt_change *= -1
+                    if command == "descend": alt_change *= -1
                     
                     self.target_pose_map.pose.position.x = self.current_map_pose.pose.position.x
                     self.target_pose_map.pose.position.y = self.current_map_pose.pose.position.y
                     self.target_pose_map.pose.position.z += alt_change
-                    self.get_logger().info(f"User command: Relative altitude change {alt_change:+.1f}m. New target Z: {self.target_pose_map.pose.position.z:.2f}m")
+                    self.get_logger().info(f"Relative altitude change {alt_change:+.1f}m. New target Z: {self.target_pose_map.pose.position.z:.2f}m")
                     self.state = "MOVING"
-
                 except ValueError:
-                    self.get_logger().error(f"Invalid altitude command: {cmd[1]} is not a number.")
+                    self.get_logger().error(f"Invalid altitude value: {cmd[1]}")
 
             elif command == "maintain" and len(cmd) > 1:
                 try:
                     if self.state not in ["IDLE", "MOVING"]:
-                        self.get_logger().warn(f"Cannot maintain altitude in state: {self.state}. Must be flying (IDLE or MOVING).")
+                        self.get_logger().warn(f"Cannot maintain altitude in state: {self.state}. Must be flying.")
                         continue
 
                     target_alt = float(cmd[1])
                     self.target_pose_map.pose.position.x = self.current_map_pose.pose.position.x
                     self.target_pose_map.pose.position.y = self.current_map_pose.pose.position.y
                     self.target_pose_map.pose.position.z = target_alt
-                    self.get_logger().info(f"User command: Maintaining absolute altitude at {target_alt:.2f}m.")
+                    self.get_logger().info(f"Maintaining absolute altitude at {target_alt:.2f}m.")
                     self.state = "MOVING"
-
                 except ValueError:
-                    self.get_logger().error(f"Invalid altitude for maintain: {cmd[1]} is not a number.")
+                    self.get_logger().error(f"Invalid altitude value: {cmd[1]}")
 
-            # --- 짐벌 명령어 처리 ---
-            elif command == "gimbal_angle" and len(cmd) >= 2:
-                try:
-                    pitch = float(cmd[1])
-                    yaw = float(cmd[2]) if len(cmd) >= 3 else 0.0
-                    self.get_logger().info(f"User command: GIMBAL_ANGLE to Pitch: {pitch}, Yaw: {yaw}")
-                    self.publish_vehicle_command(
-                        VehicleCommand.VEHICLE_CMD_DO_MOUNT_CONTROL,
-                        param1=pitch, param2=0.0, param3=yaw, param7=2.0
-                    )
-                except ValueError:
-                    self.get_logger().error(f"Invalid angle value in gimbal command.")
+            elif command == "look" and len(cmd) > 1:
+                sub_command = cmd[1].lower()
+                if sub_command == "front":
+                    self.get_logger().info("User command: LOOK FRONT")
+                    self.publish_vehicle_command(VehicleCommand.VEHICLE_CMD_DO_MOUNT_CONTROL, param1=0.0, param3=0.0, param7=2.0)
+                elif sub_command == "down":
+                    self.get_logger().info("User command: LOOK DOWN")
+                    self.publish_vehicle_command(VehicleCommand.VEHICLE_CMD_DO_MOUNT_CONTROL, param1=-90.0, param3=0.0, param7=2.0)
+                else:
+                    try:
+                        self.point_gimbal_at_enu_via_gps(int(sub_command))
+                    except (ValueError, IndexError):
+                        self.get_logger().error(f"Invalid look command. Use 'front', 'down', or index 0-{len(self.waypoints)-1}")
 
-            elif command == "gimbal_reset":
-                self.get_logger().info("User command: GIMBAL_RESET (pointing forward)")
-                self.publish_vehicle_command(
-                    VehicleCommand.VEHICLE_CMD_DO_MOUNT_CONTROL,
-                    param1=0.0, param2=0.0, param3=0.0, param7=2.0
-                )
-
-            elif command == "gimbal_down":
-                self.get_logger().info("User command: GIMBAL_DOWN (pointing down)")
-                self.publish_vehicle_command(
-                    VehicleCommand.VEHICLE_CMD_DO_MOUNT_CONTROL,
-                    param1=-90.0, param2=0.0, param3=0.0, param7=2.0
-                )
-
+            elif command == "look_enu" and len(cmd) > 1:
+                 try:
+                    self.point_gimbal_at_enu_manually(int(cmd[1]))
+                 except (ValueError, IndexError):
+                    self.get_logger().error(f"Invalid look_enu command. Use index 0-{len(self.waypoints)-1}")
             else:
                 self.get_logger().warn(f"Unknown command: '{line.strip()}'")
 
+    def attitude_callback(self, msg: VehicleAttitude):
+        self.current_attitude = msg
+
+    def gimbal_status_callback(self, msg: GimbalDeviceAttitudeStatus):
+        q = msg.q
+        sinp = 2 * (q[0] * q[2] - q[3] * q[1])
+        pitch = math.asin(sinp) if abs(sinp) < 1 else math.copysign(math.pi / 2, sinp)
+        siny_cosp = 2 * (q[0] * q[3] + q[1] * q[2])
+        cosy_cosp = 1 - 2 * (q[2] * q[2] + q[3] * q[3])
+        yaw = math.atan2(siny_cosp, cosy_cosp)
+        self.get_logger().info(
+            f"Gimbal Status -> Pitch: {math.degrees(pitch):.1f} deg, Yaw (relative): {math.degrees(yaw):.1f} deg",
+            throttle_duration_sec=1
+        )
+
     def local_position_callback(self, msg: VehicleLocalPosition):
         self.current_local_pos = msg
+        if self.ref_lat == 0.0 and msg.ref_lat != 0.0:
+            self.ref_lat = msg.ref_lat
+            self.ref_lon = msg.ref_lon
+            self.ref_alt = msg.ref_alt
+            self.get_logger().info(f"GPS Reference Initialized: LAT={self.ref_lat}, LON={self.ref_lon}, ALT={self.ref_alt}")
         self.run_state_machine()
+
+    def land_detected_callback(self, msg: VehicleLandDetected):
+        self.land_detected = msg
 
     def update_current_map_pose(self):
         try:
             trans = self.tf_buffer.lookup_transform('map', self.drone_frame_id, rclpy.time.Time())
-            if self.current_map_pose is None:
-                self.current_map_pose = PoseStamped()
+            if self.current_map_pose is None: self.current_map_pose = PoseStamped()
             self.current_map_pose.pose.position.x = trans.transform.translation.x
             self.current_map_pose.pose.position.y = trans.transform.translation.y
             self.current_map_pose.pose.position.z = trans.transform.translation.z
             return True
         except TransformException as e:
-            if self.state != "INIT":
-                self.get_logger().warn(f"Could not get current drone pose in map frame: {e}", throttle_duration_sec=1.0)
+            if self.state != "INIT": self.get_logger().warn(f"TF lookup failed: {e}", throttle_duration_sec=1.0)
             return False
 
     def publish_offboard_control_mode(self):
@@ -256,49 +285,80 @@ class InteractiveMissionNode(Node):
 
     def publish_map_based_setpoint(self):
         if self.current_map_pose is None or self.current_local_pos is None: return
-
         delta_map_x = self.target_pose_map.pose.position.x - self.current_map_pose.pose.position.x
         delta_map_y = self.target_pose_map.pose.position.y - self.current_map_pose.pose.position.y
         delta_map_z = self.target_pose_map.pose.position.z - self.current_map_pose.pose.position.z
-        
-        delta_ned_x = delta_map_y
-        delta_ned_y = delta_map_x
-        delta_ned_z = -delta_map_z
-
+        delta_ned_x, delta_ned_y, delta_ned_z = delta_map_y, delta_map_x, -delta_map_z
         target_ned_x = self.current_local_pos.x + delta_ned_x
         target_ned_y = self.current_local_pos.y + delta_ned_y
         target_ned_z = self.current_local_pos.z + delta_ned_z
-
-        msg = TrajectorySetpoint()
-        msg.position = [float(target_ned_x), float(target_ned_y), float(target_ned_z)]
-        msg.yaw = 0.0
-        msg.timestamp = int(self.get_clock().now().nanoseconds / 1000)
+        msg = TrajectorySetpoint(position=[float(target_ned_x), float(target_ned_y), float(target_ned_z)], yaw=0.0, timestamp=int(self.get_clock().now().nanoseconds / 1000))
         self.trajectory_setpoint_publisher.publish(msg)
-        
+
     def publish_vehicle_command(self, command, **kwargs):
-        """범용 VehicleCommand 메시지 발행 함수"""
-        msg = VehicleCommand(command=command, timestamp=int(self.get_clock().now().nanoseconds / 1000))
-        msg.param1 = float(kwargs.get("param1", 0.0))
-        msg.param2 = float(kwargs.get("param2", 0.0))
-        msg.param3 = float(kwargs.get("param3", 0.0))
-        msg.param4 = float(kwargs.get("param4", 0.0))
-        msg.param5 = float(kwargs.get("param5", 0.0))
-        msg.param6 = float(kwargs.get("param6", 0.0))
-        msg.param7 = float(kwargs.get("param7", 0.0))
-        msg.target_system = 1
-        msg.target_component = 1 # 짐벌의 경우 154로 직접 지정할 수도 있음
-        msg.from_external = True
+        msg = VehicleCommand(command=command, timestamp=int(self.get_clock().now().nanoseconds / 1000), from_external=True, target_system=1, target_component=1)
+        for i in range(1, 8): msg.__setattr__(f'param{i}', float(kwargs.get(f"param{i}", 0.0)))
         self.vehicle_command_publisher.publish(msg)
 
-    def check_arrival(self, tolerance=0.8):
+    def enu_to_gps(self, x, y, z):
+        if self.ref_lat == 0.0:
+            self.get_logger().error("GPS reference not set. Cannot convert ENU to GPS.")
+            return None, None, None
+        earth_radius = 6378137.0
+        d_lon = math.degrees(x / (earth_radius * math.cos(math.radians(self.ref_lat))))
+        d_lat = math.degrees(y / earth_radius)
+        return self.ref_lat + d_lat, self.ref_lon + d_lon, self.ref_alt + z
+
+    def point_gimbal_at_enu_via_gps(self, target_index):
+        if not (0 <= target_index < len(self.waypoints)):
+            self.get_logger().error(f"Waypoint index {target_index} out of bounds.")
+            return
+        wp = self.waypoints[target_index]
+        self.get_logger().info(f"[GPS Method] Converting ENU target {target_index} to GPS...")
+        lat, lon, alt = self.enu_to_gps(wp[0], wp[1], wp[2])
+        if lat is not None:
+            self.get_logger().info(f"Pointing gimbal to GPS: LAT={lat:.6f}, LON={lon:.6f}, ALT={alt:.2f}")
+            self.publish_vehicle_command(VehicleCommand.VEHICLE_CMD_DO_MOUNT_CONTROL, param4=alt, param5=lat, param6=lon, param7=4.0)
+    
+    def point_gimbal_at_enu_manually(self, target_index):
+        if self.current_map_pose is None or self.current_attitude is None:
+            self.get_logger().warn("Drone pose or attitude not available for manual gimbal control.")
+            return
+        if not (0 <= target_index < len(self.waypoints)):
+            self.get_logger().error(f"Waypoint index {target_index} out of bounds.")
+            return
+
+        drone_pos = self.current_map_pose.pose.position
+        target_pos = self.waypoints[target_index]
+        
+        delta_x = target_pos[0] - drone_pos.x  # East
+        delta_y = target_pos[1] - drone_pos.y  # North
+        delta_z = target_pos[2] - drone_pos.z  # Up
+        
+        # <<< FIX: 올바른 Pitch 계산 (목표가 아래에 있으면 음수) >>>
+        distance_2d = math.sqrt(delta_x**2 + delta_y**2)
+        pitch_rad = math.atan2(delta_z, distance_2d)
+        
+        # <<< FIX: 올바른 Yaw 계산 (PX4 기준: 북쪽=0, 시계방향) >>>
+        map_yaw_rad = math.atan2(delta_y, delta_x)
+        map_yaw_deg = math.degrees(map_yaw_rad)
+        px4_yaw_deg = 90.0 - map_yaw_deg
+        if px4_yaw_deg > 180: px4_yaw_deg -= 360.0
+        if px4_yaw_deg < -180: px4_yaw_deg += 360.0
+        
+        self.get_logger().info(f"[Manual Method] Pointing gimbal to ENU target {target_index}.")
+        self.get_logger().info(f"  - Calculated Pitch: {math.degrees(pitch_rad):.1f} deg, Absolute Yaw: {px4_yaw_deg:.1f} deg")
+
+        self.publish_vehicle_command(VehicleCommand.VEHICLE_CMD_DO_MOUNT_CONTROL, param1=math.degrees(pitch_rad), param3=px4_yaw_deg, param7=2.0)
+    
+    def check_arrival(self, tolerance=1.5):
         if self.current_map_pose is None: return False
         pos = self.current_map_pose.pose.position
         target_pos = self.target_pose_map.pose.position
-        distance = math.sqrt((pos.x - target_pos.x)**2 + (pos.y - target_pos.y)**2 + (pos.z - target_pos.z)**2)
-        return distance < tolerance
+        return math.sqrt((pos.x - target_pos.x)**2 + (pos.y - target_pos.y)**2 + (pos.z - target_pos.z)**2) < tolerance
 
     def run_state_machine(self):
-        if not self.update_current_map_pose() or self.current_local_pos is None:
+        if not self.update_current_map_pose() or self.current_local_pos is None or self.land_detected is None:
             return
 
         state_msg = String(data=self.state)
@@ -307,10 +367,10 @@ class InteractiveMissionNode(Node):
         if self.state not in ["LANDING", "LANDED", "INIT"]:
              self.publish_offboard_control_mode()
 
-        # --- 상태 로직 ---
         if self.state == "INIT":
-            self.get_logger().info("TF and Local Position received. Starting handshake.", once=True)
-            self.state = "HANDSHAKE"
+            self.get_logger().info("System ready, waiting for first local position message to start handshake.", once=True)
+            if self.current_local_pos:
+                self.state = "HANDSHAKE"
 
         elif self.state == "HANDSHAKE":
             sp_msg = TrajectorySetpoint(position=[self.current_local_pos.x, self.current_local_pos.y, self.current_local_pos.z], timestamp=int(self.get_clock().now().nanoseconds / 1000))
@@ -353,13 +413,11 @@ class InteractiveMissionNode(Node):
 
         elif self.state == "LANDING":
             self.publish_vehicle_command(VehicleCommand.VEHICLE_CMD_NAV_LAND)
-            # PX4가 착륙을 감지할 때까지 대기
-            if self.current_local_pos.landed:
+            if self.land_detected.landed:
                 self.get_logger().info("Landed successfully. Ready to be armed again with 'arm' command.")
                 self.state = "LANDED"
         
         elif self.state == "LANDED":
-            # 착륙 후 대기 상태. 사용자 'arm' 명령을 기다림.
             pass
 
 def main(args=None):
@@ -369,10 +427,12 @@ def main(args=None):
         rclpy.spin(mission_node)
     except (KeyboardInterrupt, SystemExit):
         mission_node.get_logger().info("Shutdown requested. Forcing landing.")
-        mission_node.publish_vehicle_command(VehicleCommand.VEHICLE_CMD_NAV_LAND)
+        if hasattr(mission_node, 'state') and mission_node.state not in ["LANDED", "INIT"]:
+             mission_node.publish_vehicle_command(VehicleCommand.VEHICLE_CMD_NAV_LAND)
     finally:
-        mission_node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            mission_node.destroy_node()
+            rclpy.shutdown()
 
 if __name__ == '__main__':
     main()

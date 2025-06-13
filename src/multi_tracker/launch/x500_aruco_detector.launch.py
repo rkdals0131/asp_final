@@ -15,7 +15,7 @@ def generate_launch_description():
 
         Node(
             package='multi_tracker',
-            executable='multi_tracker_node',
+            executable='abscoord_marker_detection',
             name='x500_aruco_detector',
             output='screen',
             parameters=[{

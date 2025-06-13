@@ -30,7 +30,13 @@ include_directories(
 )
 
 # 실행 파일 추가
-add_executable(multi_tracker_node src/multi_tracker_node.cpp)
+add_executable(
+  multi_tracker_node src/multi_tracker_node.cpp
+)
+
+add_executable(
+  abscoord_marker_detection src/abscoord_marker_detection.cpp
+)
 
 # 필요한 의존성 링크
 ament_target_dependencies(multi_tracker_node
@@ -46,12 +52,42 @@ ament_target_dependencies(multi_tracker_node
   tf2_geometry_msgs
   vision_msgs
 )
+
+ament_target_dependencies(abscoord_marker_detection
+rclcpp
+sensor_msgs
+geometry_msgs
+std_msgs
+OpenCV
+cv_bridge
+Eigen3
+image_transport
+tf2
+tf2_geometry_msgs
+vision_msgs
+)
+
 # 런치 설정
-install(TARGETS multi_tracker_node
+install(TARGETS 
+  multi_tracker_node
+  abscoord_marker_detection
   DESTINATION lib/${PROJECT_NAME})
 
 install(DIRECTORY launch
   DESTINATION share/${PROJECT_NAME}/
+)
+
+###########
+# Python ##
+###########
+
+# Install Python modules
+ament_python_install_package(${PROJECT_NAME})
+
+# Install Python executables
+install(PROGRAMS
+  multi_tracker/marker_stack.py
+  DESTINATION lib/${PROJECT_NAME}
 )
 
 ament_package()
