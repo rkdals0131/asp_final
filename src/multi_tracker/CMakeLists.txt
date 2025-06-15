@@ -14,7 +14,17 @@ find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
-find_package(OpenCV REQUIRED)
+
+# OpenCV 컴포넌트 명시적 설정 (ArUco 포함)
+find_package(OpenCV REQUIRED 
+  COMPONENTS 
+    core
+    imgproc
+    imgcodecs
+    aruco
+    calib3d
+)
+
 find_package(cv_bridge REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(image_transport REQUIRED)

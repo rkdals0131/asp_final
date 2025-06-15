@@ -87,31 +87,70 @@ void MultiTrackerNode::image_callback(const sensor_msgs::msg::Image::SharedPtr m
     cv::aruco::detectMarkers(cv_ptr->image, _dictionary, corners, ids, _detectorParams);
 
     if (!ids.empty()) {
-        geometry_msgs::msg::TransformStamped T_map_to_custom_cam_msg;
+        // 실제 마커의 고정된 위치를 TF에서 가져오기
+        geometry_msgs::msg::TransformStamped T_map_to_actual_marker_msg;
         try {
-            // 1. TF에서 월드(map) -> 카메라(비표준) 까지의 변환을 가져옵니다.
-            T_map_to_custom_cam_msg = _tf_buffer->lookupTransform("map", _camera_frame_id, rclcpp::Time(0));
+            // 실제 마커의 위치 (TF에서 고정된 값)
+            T_map_to_actual_marker_msg = _tf_buffer->lookupTransform("map", "X1_asp/aruco_marker_6_link", rclcpp::Time(0));
+            RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+                "Actual marker position in TF: X=%.2f, Y=%.2f, Z=%.2f",
+                T_map_to_actual_marker_msg.transform.translation.x,
+                T_map_to_actual_marker_msg.transform.translation.y,
+                T_map_to_actual_marker_msg.transform.translation.z);
         } catch (const tf2::TransformException & ex) {
-            RCLCPP_WARN(this->get_logger(), "Could not transform '%s' to 'map': %s", _camera_frame_id.c_str(), ex.what());
-            return;
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000, 
+                "Could not get actual marker position: %s", ex.what());
         }
-        tf2::Transform T_map_to_custom_cam;
-        tf2::fromMsg(T_map_to_custom_cam_msg.transform, T_map_to_custom_cam);
 
-        // <<< [핵심 수정] >>>
-        // 2. 카메라의 물리적 좌표계(Back-Right-Up)와 OpenCV 광학 좌표계(Right-Down-Forward) 사이의 고정된 변환을 정의합니다.
-        // 이 변환은 하드웨어가 바뀌지 않는 한 절대 변하지 않습니다.
-        // Custom(Back-Right-Up) -> Optical(Right-Down-Forward)
-        // X_optical =  Y_custom
-        // Y_optical = -Z_custom
-        // Z_optical = -X_custom
-        tf2::Matrix3x3 R_custom_to_optical(
-             0,  1,  0,
-             0,  0, -1,
-            -1,  0,  0
-        );
-        tf2::Transform T_custom_cam_to_optical(R_custom_to_optical);
-
+        // 명시적인 TF lookup: map -> camera optical frame 직접 변환
+        geometry_msgs::msg::TransformStamped T_map_to_optical_msg;
+        std::string optical_frame_id = _camera_frame_id + "_optical_frame";
+        
+        try {
+            // 시도 1: optical frame이 존재하는 경우
+            T_map_to_optical_msg = _tf_buffer->lookupTransform("map", optical_frame_id, rclcpp::Time(0));
+            RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000, 
+                "Using direct optical frame: %s", optical_frame_id.c_str());
+        } catch (const tf2::TransformException & ex) {
+            try {
+                // 시도 2: optical frame이 없는 경우, 물리적 카메라 프레임 사용
+                T_map_to_optical_msg = _tf_buffer->lookupTransform("map", _camera_frame_id, rclcpp::Time(0));
+                RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000, 
+                    "Using physical camera frame: %s (optical frame not found)", _camera_frame_id.c_str());
+                
+                // 물리적 카메라 프레임에서 광학 프레임으로의 변환 적용
+                // 표준 ROS 카메라 광학 변환: X=right, Y=down, Z=forward
+                tf2::Transform T_physical_to_optical;
+                tf2::Matrix3x3 R_phys_to_opt(
+                     0, -1,  0,   // X_optical = -Y_physical
+                     0,  0, -1,   // Y_optical = -Z_physical  
+                     1,  0,  0    // Z_optical =  X_physical
+                );
+                T_physical_to_optical.setBasis(R_phys_to_opt);
+                T_physical_to_optical.setOrigin(tf2::Vector3(0, 0, 0));
+                
+                // 물리적 프레임 변환에 광학 변환 적용
+                tf2::Transform T_map_to_physical;
+                tf2::fromMsg(T_map_to_optical_msg.transform, T_map_to_physical);
+                tf2::Transform T_map_to_optical_corrected = T_map_to_physical * T_physical_to_optical;
+                T_map_to_optical_msg.transform = tf2::toMsg(T_map_to_optical_corrected);
+                
+            } catch (const tf2::TransformException & ex2) {
+                RCLCPP_ERROR(this->get_logger(), "Could not find camera frame '%s' or '%s': %s", 
+                           _camera_frame_id.c_str(), optical_frame_id.c_str(), ex2.what());
+                return;
+            }
+        }
+        
+        // TF에서 가져온 변환을 tf2::Transform으로 변환
+        tf2::Transform T_map_to_optical;
+        tf2::fromMsg(T_map_to_optical_msg.transform, T_map_to_optical);
+        
+        // 디버깅: 카메라 광학 프레임 위치 출력
+        tf2::Vector3 optical_pos = T_map_to_optical.getOrigin();
+        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000, 
+            "Camera optical frame in map: X=%.2f, Y=%.2f, Z=%.2f", 
+            optical_pos.x(), optical_pos.y(), optical_pos.z());
 
         vision_msgs::msg::Detection3DArray detections_msg;
         detections_msg.header.stamp = msg->header.stamp;
@@ -124,10 +163,15 @@ void MultiTrackerNode::image_callback(const sensor_msgs::msg::Image::SharedPtr m
                 cv::Point3f( half_size, -half_size, 0), cv::Point3f(-half_size, -half_size, 0)
             };
             cv::Vec3d rvec, tvec;
-            // 3. solvePnP는 항상 카메라 광학 좌표계(Optical) 기준으로 마커의 위치를 계산합니다.
+            // solvePnP: 카메라 광학 좌표계 기준 마커의 상대적 위치와 자세
             cv::solvePnP(objectPoints, corners[i], _camera_matrix, _dist_coeffs, rvec, tvec);
             
-            // solvePnP 결과(rvec, tvec)로 T_optical_to_marker 변환을 생성합니다.
+            // 디버깅: solvePnP 결과 (광학 좌표계 기준)
+            RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+                "Marker %d in camera optical frame: X=%.2f, Y=%.2f, Z=%.2f", 
+                ids[i], tvec[0], tvec[1], tvec[2]);
+            
+            // solvePnP 결과를 tf2::Transform으로 변환
             tf2::Transform T_optical_to_marker;
             T_optical_to_marker.setOrigin(tf2::Vector3(tvec[0], tvec[1], tvec[2]));
             cv::Mat R_cv;
@@ -138,9 +182,15 @@ void MultiTrackerNode::image_callback(const sensor_msgs::msg::Image::SharedPtr m
                 R_cv.at<double>(2,0), R_cv.at<double>(2,1), R_cv.at<double>(2,2)
             );
             
-            // 4. 최종 변환 체인을 올바르게 구성합니다.
-            // 월드 -> 카메라(물리) -> 카메라(광학) -> 마커
-            tf2::Transform T_map_to_marker = T_map_to_custom_cam * T_custom_cam_to_optical * T_optical_to_marker;
+            // 핵심: 명시적 TF 변환으로 map 프레임에서 마커의 절대 위치 계산
+            // T_map_to_marker = T_map_to_optical * T_optical_to_marker
+            tf2::Transform T_map_to_marker = T_map_to_optical * T_optical_to_marker;
+            
+            // 결과 디버깅
+            tf2::Vector3 marker_pos_in_map = T_map_to_marker.getOrigin();
+            RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+                "Marker %d absolute position in map: X=%.2f, Y=%.2f, Z=%.2f", 
+                ids[i], marker_pos_in_map.x(), marker_pos_in_map.y(), marker_pos_in_map.z());
             
             vision_msgs::msg::Detection3D detection;
             detection.header = detections_msg.header;
@@ -160,6 +210,10 @@ void MultiTrackerNode::image_callback(const sensor_msgs::msg::Image::SharedPtr m
                 _target[0] = hypothesis.pose.pose.position.x;
                 _target[1] = hypothesis.pose.pose.position.y;
                 _target[2] = hypothesis.pose.pose.position.z;
+                
+                // 최종 결과 로그
+                RCLCPP_INFO(this->get_logger(), "Final Marker %d in map frame: X=%.2f, Y=%.2f, Z=%.2f", 
+                           ids[i], _target[0], _target[1], _target[2]);
             }
         }
 
