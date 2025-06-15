@@ -25,13 +25,19 @@ class PathFollowerNode(Node):
         super().__init__('path_follower_advanced')
 
         # === 핵심 파라미터 ===
-        self.declare_parameter('lookahead_k', 1.5)
-        self.declare_parameter('lookahead_min', 1.0)
-        self.declare_parameter('lookahead_max', 6.0)
-        self.declare_parameter('max_speed', 3.0)
-        self.declare_parameter('min_speed', 1.0)
-        self.declare_parameter('base_accel', 0.5, 
-            ParameterDescriptor(description="기본 선형 가속도 (m/s²) - 정상상태오류 방지용"))
+        self.declare_parameter('lookahead_k', 2.0)
+        self.declare_parameter('lookahead_min', 0.5)
+        self.declare_parameter('lookahead_max', 3.0)
+        self.declare_parameter('max_speed', 5.0)
+        self.declare_parameter('min_speed', 0.5)
+        self.declare_parameter('max_accel', 0.8,
+            ParameterDescriptor(description="최대 종방향 가속도 (m/s²)"))
+        self.declare_parameter('max_decel', 1.0,
+            ParameterDescriptor(description="최대 종방향 감속도 (m/s²)"))
+        self.declare_parameter('min_accel', 0.1,
+            ParameterDescriptor(description="최소 종방향 가속도 (m/s²) - 정상상태오차 방지"))
+        self.declare_parameter('max_lateral_accel', 2.0,
+            ParameterDescriptor(description="최대 횡방향 가속도 (m/s²) - 커브 속도 제한"))
         self.declare_parameter('waypoint_reach_threshold', 1.5)
         self.declare_parameter('path_density', 0.2)
         self.declare_parameter('map_frame', 'map')
@@ -43,7 +49,10 @@ class PathFollowerNode(Node):
         self.LOOKAHEAD_MAX = self.get_parameter('lookahead_max').value
         self.MAX_SPEED = self.get_parameter('max_speed').value
         self.MIN_SPEED = self.get_parameter('min_speed').value
-        self.BASE_ACCEL = self.get_parameter('base_accel').value
+        self.MAX_ACCEL = self.get_parameter('max_accel').value
+        self.MAX_DECEL = self.get_parameter('max_decel').value
+        self.MIN_ACCEL = self.get_parameter('min_accel').value
+        self.MAX_LATERAL_ACCEL = self.get_parameter('max_lateral_accel').value
         self.REACH_THRESHOLD = self.get_parameter('waypoint_reach_threshold').value
         self.PATH_DENSITY = self.get_parameter('path_density').value
         self.MAP_FRAME = self.get_parameter('map_frame').value
@@ -207,16 +216,13 @@ class PathFollowerNode(Node):
         dist = math.hypot(self.vehicle_pose_map[0] - wp_x, self.vehicle_pose_map[1] - wp_y)
         
         # 미션 타입별 도착 임계값 설정
-        if wp_mission == 2:  # 드론 이륙 대기 - 정상상태오차 고려하여 30cm
-            arrival_threshold = 0.3
-        else:  # 기본 임계값
-            arrival_threshold = self.REACH_THRESHOLD
+        arrival_threshold = self.REACH_THRESHOLD
         
         if dist < arrival_threshold:
             self.get_logger().info(f"✅ Waypoint {self.current_waypoint_idx} reached (Mission: {wp_mission}, Target Speed: {wp_speed}, Distance: {dist:.2f}m)")
             
             if wp_mission == 2:  # 드론 이륙 대기
-                # base_accel을 활용한 정확한 정지로 30cm 이내 도달 성공
+                # 물리적 가속도 제약을 활용한 정확한 정지로 30cm 이내 도달 성공
                 self.is_mission_paused = True
                 self.get_logger().info("🚁 Drone takeoff waiting point reached within 30cm. Vehicle accurately stopped.")
                 print("\n>>> Enter 'resume' to continue after drone takeoff")
@@ -315,8 +321,8 @@ class PathFollowerNode(Node):
         x_fine, y_fine = splev(u_fine, tck)
         path_points = list(zip(x_fine, y_fine))
         
-        # 사전 속도 플래닝: 웨이포인트 제약 조건을 모두 고려한 물리적 속도 프로파일 생성
-        velocities = self._generate_physics_based_velocity_profile(path_points, wx, wy)
+        # 사전 속도 플래닝: 웨이포인트 제약 + 곡률 기반 횡방향 가속도 제한
+        velocities = self._generate_physics_based_velocity_profile(path_points, wx, wy, x_fine, y_fine)
         
         self.get_logger().info(f"Generated main path: {len(path_points)} points")
         return path_points, velocities
@@ -336,7 +342,7 @@ class PathFollowerNode(Node):
         return list(zip(x_fine, y_fine))
 
     def _generate_smooth_velocity_profile(self, path_points, start_vel=0.0, end_vel=0.0):
-        """부드러운 속도 프로파일 생성 - base_accel을 활용한 물리적 가속도 기반"""
+        """부드러운 속도 프로파일 생성 - 물리적 가속도 기반"""
         if not path_points or len(path_points) < 2:
             return [max(start_vel, self.MIN_SPEED)] * len(path_points)
         
@@ -353,10 +359,10 @@ class PathFollowerNode(Node):
             # 정규화된 거리 (0~1)
             s_norm = s / total_distance
             
-            # base_accel을 활용한 물리적 가속도 기반 속도 계산
+            # 물리적 가속도 기반 속도 계산
             if end_vel > start_vel:  # 가속
                 # v² = v₀² + 2as를 활용한 가속
-                vel_squared = start_vel**2 + 2 * self.BASE_ACCEL * s
+                vel_squared = start_vel**2 + 2 * self.MAX_ACCEL * s
                 vel = math.sqrt(max(0, vel_squared))
                 
                 # 목표 속도를 넘지 않도록 제한
@@ -379,33 +385,178 @@ class PathFollowerNode(Node):
             
         return velocities
 
-    def _generate_physics_based_velocity_profile(self, path_points, wx, wy):
-        """물리 법칙 기반 사전 속도 플래닝 - 모든 웨이포인트 제약 조건 동시 고려"""
+    def _generate_physics_based_velocity_profile(self, path_points, wx, wy, x_fine, y_fine):
+        """통합 물리 법칙 기반 속도 플래닝 - 종방향/횡방향 가속도 + 웨이포인트 제약 통합 처리"""
         if not path_points:
             return []
         
-        # 1단계: 경로점별 거리 계산
+        # 1단계: 기본 정보 계산
         distances = self._calculate_path_distances(path_points)
+        curvature_limited_velocities = self._calculate_curvature_limited_velocities(x_fine, y_fine)
         
-        # 2단계: 초기 속도 할당 (웨이포인트 기반)
-        initial_velocities = self._map_waypoint_velocities_to_path(path_points, wx, wy)
+        # 2단계: 웨이포인트 제약과 곡률 제약 통합
+        target_velocities = self._combine_waypoint_and_curvature_velocities(
+            path_points, wx, wy, curvature_limited_velocities)
         
-        # 3단계: 웨이포인트 제약 조건 수집
-        waypoint_constraints = self._collect_waypoint_constraints(path_points, distances)
+        # 3단계: 통합 물리 제약 적용 (역방향 + 전방향)
+        final_velocities = self._apply_unified_physics_constraints(
+            path_points, distances, target_velocities)
         
-        # 4단계: 역방향 감속 프로파일 적용 (가장 중요!)
-        backward_velocities = self._apply_backward_deceleration_constraints(
-            path_points, distances, initial_velocities, waypoint_constraints)
-        
-        # 5단계: 전방향 가속 프로파일 적용 (물리적 가속 한계)
-        final_velocities = self._apply_forward_acceleration_constraints(
-            path_points, distances, backward_velocities)
-        
-        self.get_logger().info(f"Physics-based velocity profile generated. "
-                              f"Avg speed: {np.mean(final_velocities):.2f} m/s, "
-                              f"Min: {np.min(final_velocities):.2f}, Max: {np.max(final_velocities):.2f}")
+        self.get_logger().info(f"Unified Physics Velocity Profile: "
+                              f"Avg: {np.mean(final_velocities):.2f} m/s, "
+                              f"Range: [{np.min(final_velocities):.2f}, {np.max(final_velocities):.2f}] m/s")
         
         return final_velocities
+    
+    def _calculate_curvature_limited_velocities(self, x_fine, y_fine):
+        """곡률 기반 횡방향 가속도 제한 속도 계산"""
+        curvatures = self._calculate_curvature(x_fine, y_fine)
+        curvature_limited_velocities = []
+        
+        for curvature in curvatures:
+            abs_curvature = abs(curvature)
+            
+            if abs_curvature < 1e-6:  # 직선 구간
+                max_vel = self.MAX_SPEED
+            else:
+                # v_max = √(a_lateral_max / κ) 
+                # 횡방향 가속도: a_lateral = v² × κ
+                max_vel = math.sqrt(self.MAX_LATERAL_ACCEL / abs_curvature)
+            
+            # MIN_SPEED와 MAX_SPEED 범위 적용
+            max_vel = np.clip(max_vel, self.MIN_SPEED, self.MAX_SPEED)
+            curvature_limited_velocities.append(max_vel)
+        
+        return curvature_limited_velocities
+    
+    def _combine_waypoint_and_curvature_velocities(self, path_points, wx, wy, curvature_velocities):
+        """웨이포인트 기반 속도와 곡률 제한 속도를 결합"""
+        waypoint_velocities = self._map_waypoint_velocities_to_path(path_points, wx, wy)
+        
+        # 두 제약 조건 중 더 작은 값 선택 (더 안전한 속도)
+        combined_velocities = []
+        for i in range(len(path_points)):
+            wp_vel = waypoint_velocities[i]
+            curve_vel = curvature_velocities[i] if i < len(curvature_velocities) else self.MAX_SPEED
+            
+            # 두 제약 중 더 엄격한 것 선택
+            final_vel = min(wp_vel, curve_vel)
+            combined_velocities.append(final_vel)
+        
+        return combined_velocities
+    
+    def _apply_unified_physics_constraints(self, path_points, distances, target_velocities):
+        """통합 물리 제약 적용 - 웨이포인트간 부드러운 속도 전환 + 가속도 제한"""
+        velocities = target_velocities.copy()
+        
+        # 1단계: 웨이포인트 기반 역방향 감속 제약
+        velocities = self._apply_waypoint_deceleration_constraints(path_points, distances, velocities)
+        
+        # 2단계: 전방향 가속 제약 (연속성 보장)
+        velocities = self._apply_forward_acceleration_limits(distances, velocities)
+        
+        # 3단계: 역방향 감속 제약 (최종 검증)
+        velocities = self._apply_backward_deceleration_limits(distances, velocities)
+        
+        # 4단계: 최소 가속도 보장 (정상상태오차 방지)
+        velocities = self._ensure_minimum_acceleration(distances, velocities)
+        
+        return velocities
+    
+    def _apply_waypoint_deceleration_constraints(self, path_points, distances, velocities):
+        """웨이포인트 정지/저속 구간을 위한 감속 제약"""
+        # 정지 및 저속 웨이포인트 찾기
+        critical_points = []
+        for wp_x, wp_y, mission_type, target_speed in self.raw_waypoints:
+            if mission_type in [2, 4] or (target_speed >= 0 and target_speed <= 1.0):
+                # 가장 가까운 경로점 찾기
+                closest_idx = 0
+                min_dist = float('inf')
+                for i, (px, py) in enumerate(path_points):
+                    dist = math.hypot(px - wp_x, py - wp_y)
+                    if dist < min_dist:
+                        min_dist = dist
+                        closest_idx = i
+                
+                constraint_speed = 0.0 if mission_type in [2, 4] else target_speed
+                critical_points.append((closest_idx, distances[closest_idx], constraint_speed))
+        
+        # 각 중요 지점에서 역방향 감속 적용
+        for target_idx, target_dist, target_speed in critical_points:
+            for i in range(target_idx, -1, -1):
+                distance_to_target = target_dist - distances[i]
+                if distance_to_target >= 0:
+                    # 감속 가능한 최대 속도: v = √(v_target² + 2*a_decel*s)
+                    max_speed_for_decel = math.sqrt(
+                        target_speed**2 + 2 * self.MAX_DECEL * distance_to_target
+                    )
+                    velocities[i] = min(velocities[i], max_speed_for_decel)
+        
+        return velocities
+    
+    def _apply_forward_acceleration_limits(self, distances, velocities):
+        """전방향 가속도 제한 - 부드러운 속도 전환"""
+        result_velocities = velocities.copy()
+        
+        for i in range(1, len(velocities)):
+            distance_step = distances[i] - distances[i-1]
+            prev_speed = result_velocities[i-1]
+            target_speed = velocities[i]
+            
+            if distance_step > 0:
+                if target_speed > prev_speed:  # 가속 구간
+                    # 최대 가속도 제한: v = √(v₀² + 2*a_max*s)
+                    max_achievable_speed = math.sqrt(
+                        prev_speed**2 + 2 * self.MAX_ACCEL * distance_step
+                    )
+                    result_velocities[i] = min(target_speed, max_achievable_speed)
+                else:  # 감속 구간
+                    # 부드러운 감속 적용
+                    result_velocities[i] = target_speed
+        
+        return result_velocities
+    
+    def _apply_backward_deceleration_limits(self, distances, velocities):
+        """역방향 감속도 제한 - 최종 검증"""
+        result_velocities = velocities.copy()
+        
+        for i in range(len(velocities) - 2, -1, -1):
+            distance_step = distances[i+1] - distances[i]
+            next_speed = result_velocities[i+1]
+            current_speed = result_velocities[i]
+            
+            if distance_step > 0 and current_speed > next_speed:
+                # 감속 가능한 최대 속도: v = √(v_next² + 2*a_decel*s)
+                max_speed_for_decel = math.sqrt(
+                    next_speed**2 + 2 * self.MAX_DECEL * distance_step
+                )
+                result_velocities[i] = min(current_speed, max_speed_for_decel)
+        
+        return result_velocities
+    
+    def _ensure_minimum_acceleration(self, distances, velocities):
+        """최소 가속도 보장 - 정상상태오차 방지"""
+        result_velocities = velocities.copy()
+        
+        # 너무 작은 속도 변화는 최소 가속도로 보정
+        for i in range(1, len(velocities)):
+            distance_step = distances[i] - distances[i-1]
+            prev_speed = result_velocities[i-1]
+            current_speed = result_velocities[i]
+            
+            if distance_step > 0.1:  # 10cm 이상 거리에서만 적용
+                speed_diff = current_speed - prev_speed
+                if abs(speed_diff) > 0 and abs(speed_diff) / distance_step < self.MIN_ACCEL:
+                    # 최소 가속도 적용
+                    if speed_diff > 0:  # 가속
+                        result_velocities[i] = prev_speed + self.MIN_ACCEL * distance_step
+                    else:  # 감속
+                        result_velocities[i] = prev_speed - self.MIN_ACCEL * distance_step
+                    
+                    # 범위 제한
+                    result_velocities[i] = np.clip(result_velocities[i], 0.0, self.MAX_SPEED)
+        
+        return result_velocities
     
     def _map_waypoint_velocities_to_path(self, path_points, wx, wy):
         """웨이포인트별 목표 속도를 경로점에 매핑"""
@@ -434,92 +585,6 @@ class PathFollowerNode(Node):
             velocities.append(target_vel)
         
         return velocities
-    
-    def _collect_waypoint_constraints(self, path_points, distances):
-        """웨이포인트별 제약 조건 수집"""
-        constraints = []
-        
-        for wp_x, wp_y, mission_type, target_speed in self.raw_waypoints:
-            # 가장 가까운 경로점 찾기
-            closest_idx = 0
-            min_dist = float('inf')
-            
-            for i, (px, py) in enumerate(path_points):
-                dist = math.hypot(px - wp_x, py - wp_y)
-                if dist < min_dist:
-                    min_dist = dist
-                    closest_idx = i
-            
-            # 제약 조건 추가
-            constraint_speed = target_speed if target_speed >= 0 else self.MAX_SPEED
-            if mission_type == 2:  # 드론 이륙 대기 - 완전 정지
-                constraint_speed = 0.0
-            elif mission_type == 4:  # 미션 완료 - 완전 정지  
-                constraint_speed = 0.0
-            
-            constraints.append({
-                'path_idx': closest_idx,
-                'distance': distances[closest_idx],
-                'target_speed': constraint_speed,
-                'mission_type': mission_type,
-                'position': (wp_x, wp_y)
-            })
-        
-        return sorted(constraints, key=lambda x: x['distance'])  # 거리순 정렬
-    
-    def _apply_backward_deceleration_constraints(self, path_points, distances, initial_velocities, constraints):
-        """역방향 감속 제약 적용 - 각 웨이포인트에서 요구되는 감속을 사전 계산"""
-        velocities = initial_velocities.copy()
-        
-        # 각 제약 조건에 대해 역방향으로 감속 프로파일 적용
-        for constraint in reversed(constraints):  # 뒤에서부터 처리
-            target_idx = constraint['path_idx']
-            target_speed = constraint['target_speed']
-            mission_type = constraint['mission_type']
-            
-            self.get_logger().info(f"Applying backward deceleration for mission {mission_type} "
-                                  f"at idx {target_idx}, target speed: {target_speed}")
-            
-            # 현재 지점에서부터 역방향으로 감속 프로파일 계산
-            for i in range(target_idx, -1, -1):  # target_idx부터 0까지 역순
-                distance_to_target = distances[target_idx] - distances[i]
-                
-                if distance_to_target <= 0:
-                    # 목표 지점이면 목표 속도 설정
-                    velocities[i] = target_speed
-                else:
-                    # base_accel로 감속 가능한 최대 속도 계산: v = √(v_target² + 2*a*s)
-                    max_speed_at_point = math.sqrt(
-                        target_speed**2 + 2 * self.BASE_ACCEL * distance_to_target
-                    )
-                    
-                    # 기존 속도와 물리적 제한 속도 중 작은 값 선택
-                    velocities[i] = min(velocities[i], max_speed_at_point)
-                    
-                    # MIN_SPEED 보장 (단, 정지 구간 제외)
-                    if target_speed > 0:  # 정지가 아닌 경우만
-                        velocities[i] = max(velocities[i], self.MIN_SPEED)
-        
-        return velocities
-    
-    def _apply_forward_acceleration_constraints(self, path_points, distances, velocities):
-        """전방향 가속 제약 적용 - 물리적 가속 한계 고려"""
-        result_velocities = velocities.copy()
-        
-        for i in range(1, len(velocities)):
-            distance_step = distances[i] - distances[i-1]
-            prev_speed = result_velocities[i-1]
-            
-            if distance_step > 0:
-                # base_accel로 가속 가능한 최대 속도: v = √(v₀² + 2*a*s)
-                max_achievable_speed = math.sqrt(
-                    prev_speed**2 + 2 * self.BASE_ACCEL * distance_step
-                )
-                
-                # 물리적 제한과 계획된 속도 중 작은 값 선택
-                result_velocities[i] = min(result_velocities[i], max_achievable_speed)
-        
-        return result_velocities
 
 
 
@@ -605,7 +670,7 @@ class PathFollowerNode(Node):
         marker_array = MarkerArray()
         
         # 2m 간격으로 표시 (너무 많으면 시각적으로 복잡)
-        step = max(1, int(1.5 / self.PATH_DENSITY))
+        step = max(1, int(0.5 / self.PATH_DENSITY))
         
         for i in range(0, len(self.full_path_points), step):
             if i >= len(self.full_target_velocities):
@@ -705,7 +770,8 @@ class PathFollowerNode(Node):
     def _load_waypoints(self):
         """웨이포인트 데이터 로딩"""
         return [
-            (-132.71, 58.04, 1, -1.0),    # 시작점
+            (-124.48, 43.38, 1, -1.0),
+            (-132.71, 58.04, 1, 2.0),    
             (-132.87, 64.00, 2, 0.0),    # 드론 이륙 대기
             (-129.23, 69.36, 3, -1.0),    
             (-120.85, 73.20, 3, -1.0),    
