@@ -97,6 +97,7 @@ ament_python_install_package(${PROJECT_NAME})
 # Install Python executables
 install(PROGRAMS
   multi_tracker/marker_stack.py
+  multi_tracker/debug.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

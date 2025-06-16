@@ -55,6 +55,7 @@ private:
     int _param_dictionary;
     double _param_marker_size;
 
+    std::string _optical_frame_id;
     std::string _image_topic;
     std::string _camera_info_topic;
     std::string _target_id_topic;

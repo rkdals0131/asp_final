@@ -9,6 +9,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPo
 from px4_msgs.msg import OffboardControlMode, TrajectorySetpoint, VehicleCommand, VehicleLocalPosition, VehicleLandDetected, VehicleAttitude, GimbalDeviceAttitudeStatus
 from geometry_msgs.msg import PoseStamped
 from std_msgs.msg import String
+from visualization_msgs.msg import Marker
 
 # --- TF2 관련 모듈 임포트 ---
 from tf2_ros import TransformException
@@ -35,6 +36,7 @@ class InteractiveMissionNode(Node):
         self.trajectory_setpoint_publisher = self.create_publisher(TrajectorySetpoint, "/fmu/in/trajectory_setpoint", 10)
         self.vehicle_command_publisher = self.create_publisher(VehicleCommand, "/fmu/in/vehicle_command", 10)
         self.state_publisher = self.create_publisher(String, "/drone/state", 10)
+        self.marker_publisher = self.create_publisher(Marker, "/final_destination_marker", 10)
 
         # --- 서브스크라이버 ---
         qos_profile = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, durability=DurabilityPolicy.TRANSIENT_LOCAL, history=HistoryPolicy.KEEP_LAST, depth=1)
@@ -106,10 +108,11 @@ class InteractiveMissionNode(Node):
         print("    climb <meters>           - 지정한 미터만큼 상대 고도 상승")
         print("    descend <meters>         - 지정한 미터만큼 상대 고도 하강")
         print("    maintain <altitude>      - 지정한 절대 고도로 이동/유지")
+        print("    moveto <x> <y> <z>       - 지정한 절대좌표(map frame)로 이동")
         # <<< CHANGE: 명령어 도움말 업데이트 >>>
         print("  [짐벌 제어]")
         print("    look <0-5>               - 지정 번호의 마커를 한번 바라봄")
-        print("    look front               - 짐벌 정면으로 초기화")
+        print("    look forward             - 짐벌 정면으로 초기화")
         print("    look down                - 짐벌 수직 아래로")
         print("    stare <0-5>              - 지정 번호의 마커를 계속 추적/응시")
         print("    stare stop               - 추적/응시 중지")
@@ -148,6 +151,8 @@ class InteractiveMissionNode(Node):
                 self.handle_altitude_change_command(command, cmd[1])
             elif command == "maintain" and len(cmd) > 1:
                 self.handle_maintain_command(cmd[1])
+            elif command == "moveto" and len(cmd) > 3:
+                self.handle_moveto_command(cmd[1:])
             # <<< CHANGE: 짐벌 제어 로직 수정 >>>
             elif command == "look" and len(cmd) > 1:
                 self.handle_look_command(cmd[1])
@@ -207,11 +212,30 @@ class InteractiveMissionNode(Node):
         except ValueError:
             self.get_logger().error(f"Invalid altitude value: {value_str}")
 
+    def handle_moveto_command(self, args):
+        try:
+            if self.state not in ["IDLE", "MOVING"]:
+                self.get_logger().warn(f"Cannot execute 'moveto' in state: {self.state}.")
+                return
+            if len(args) != 3:
+                self.get_logger().error("moveto command requires 3 arguments: x, y, z")
+                return
+            
+            x, y, z = float(args[0]), float(args[1]), float(args[2])
+            
+            self.target_pose_map.pose.position.x = x
+            self.target_pose_map.pose.position.y = y
+            self.target_pose_map.pose.position.z = z
+            self.get_logger().info(f"User command: MOVETO to ({x:.2f}, {y:.2f}, {z:.2f}).")
+            self.state = "MOVING"
+        except ValueError:
+            self.get_logger().error(f"Invalid coordinates for moveto. Please provide three numbers.")
+
     def handle_look_command(self, sub_command):
         self.stare_target_index = None # 'look' 명령은 항상 'stare'를 중지시킴
         sub_command = sub_command.lower()
-        if sub_command == "front":
-            self.get_logger().info("User command: LOOK FRONT")
+        if sub_command == "forward":
+            self.get_logger().info("User command: LOOK FORWARD")
             self.publish_vehicle_command(VehicleCommand.VEHICLE_CMD_DO_MOUNT_CONTROL, param1=0.0, param3=0.0, param7=2.0)
         elif sub_command == "down":
             self.get_logger().info("User command: LOOK DOWN")
@@ -220,7 +244,7 @@ class InteractiveMissionNode(Node):
             try:
                 self.point_gimbal_at_target(int(sub_command))
             except (ValueError, IndexError):
-                self.get_logger().error(f"Invalid look command. Use 'front', 'down', or index 0-{len(self.waypoints)-1}")
+                self.get_logger().error(f"Invalid look command. Use 'forward', 'down', or index 0-{len(self.waypoints)-1}")
 
     def handle_stare_command(self, sub_command):
         sub_command = sub_command.lower()
@@ -330,7 +354,186 @@ class InteractiveMissionNode(Node):
         
         # self.get_logger().info(f"Pointing gimbal to ENU target {target_index}. Pitch: {math.degrees(pitch_rad):.1f}, Yaw: {px4_yaw_deg:.1f}", throttle_duration_sec=1)
         self.publish_vehicle_command(VehicleCommand.VEHICLE_CMD_DO_MOUNT_CONTROL, param1=math.degrees(pitch_rad), param3=px4_yaw_deg, param7=2.0)
-    
+
+    def publish_all_markers(self):
+        """모든 waypoint와 final_destination 위치에 타원과 실린더 마커를 게시합니다."""
+        # Waypoint 마커들
+        for i, waypoint in enumerate(self.waypoints):
+            # 타원 마커
+            sphere_marker = Marker()
+            sphere_marker.header.frame_id = "map"
+            sphere_marker.header.stamp = self.get_clock().now().to_msg()
+            sphere_marker.ns = "waypoint_spheres"
+            sphere_marker.id = i
+            sphere_marker.type = Marker.SPHERE
+            sphere_marker.action = Marker.ADD
+
+            sphere_marker.pose.position.x = waypoint[0]
+            sphere_marker.pose.position.y = waypoint[1]
+            sphere_marker.pose.position.z = waypoint[2]
+            sphere_marker.pose.orientation.w = 1.0
+
+            # xy 3미터, z 1미터
+            sphere_marker.scale.x = 3.0
+            sphere_marker.scale.y = 3.0
+            sphere_marker.scale.z = 1.0
+
+            # 빨주노초파보 색상
+            if i == 0:
+                sphere_marker.color.r, sphere_marker.color.g, sphere_marker.color.b = 1.0, 0.0, 0.0  # 빨간색
+            elif i == 1:
+                sphere_marker.color.r, sphere_marker.color.g, sphere_marker.color.b = 1.0, 0.5, 0.0  # 주황색
+            elif i == 2:
+                sphere_marker.color.r, sphere_marker.color.g, sphere_marker.color.b = 1.0, 1.0, 0.0  # 노란색
+            elif i == 3:
+                sphere_marker.color.r, sphere_marker.color.g, sphere_marker.color.b = 0.0, 1.0, 0.0  # 초록색
+            elif i == 4:
+                sphere_marker.color.r, sphere_marker.color.g, sphere_marker.color.b = 0.0, 0.0, 1.0  # 파란색
+            elif i == 5:
+                sphere_marker.color.r, sphere_marker.color.g, sphere_marker.color.b = 0.5, 0.0, 1.0  # 보라색
+            
+            sphere_marker.color.a = 0.7
+
+            self.marker_publisher.publish(sphere_marker)
+
+            # 실린더 마커
+            cylinder_marker = Marker()
+            cylinder_marker.header.frame_id = "map"
+            cylinder_marker.header.stamp = self.get_clock().now().to_msg()
+            cylinder_marker.ns = "waypoint_cylinders"
+            cylinder_marker.id = i
+            cylinder_marker.type = Marker.CYLINDER
+            cylinder_marker.action = Marker.ADD
+
+            # 실린더는 지면에서 시작하도록 z 위치를 1.5미터 올림 (높이의 절반)
+            cylinder_marker.pose.position.x = waypoint[0]
+            cylinder_marker.pose.position.y = waypoint[1]
+            cylinder_marker.pose.position.z = waypoint[2] + 1.5
+            cylinder_marker.pose.orientation.w = 1.0
+
+            # 지름 0.5미터, 높이 3미터
+            cylinder_marker.scale.x = 0.5
+            cylinder_marker.scale.y = 0.5
+            cylinder_marker.scale.z = 3.0
+
+            # 같은 색상
+            cylinder_marker.color.r = sphere_marker.color.r
+            cylinder_marker.color.g = sphere_marker.color.g
+            cylinder_marker.color.b = sphere_marker.color.b
+            cylinder_marker.color.a = 0.7
+
+            self.marker_publisher.publish(cylinder_marker)
+
+            # 텍스트 마커
+            text_marker = Marker()
+            text_marker.header.frame_id = "map"
+            text_marker.header.stamp = self.get_clock().now().to_msg()
+            text_marker.ns = "waypoint_texts"
+            text_marker.id = i
+            text_marker.type = Marker.TEXT_VIEW_FACING
+            text_marker.action = Marker.ADD
+
+            # 텍스트를 마커 아래쪽에 위치
+            text_marker.pose.position.x = waypoint[0]
+            text_marker.pose.position.y = waypoint[1]
+            text_marker.pose.position.z = waypoint[2] - 1.0  # 마커 아래 1미터
+            text_marker.pose.orientation.w = 1.0
+
+            # 텍스트 크기
+            text_marker.scale.z = 0.8
+
+            # 텍스트 색상 (흰색)
+            text_marker.color.r = 1.0
+            text_marker.color.g = 1.0
+            text_marker.color.b = 1.0
+            text_marker.color.a = 1.0
+
+            # 텍스트 내용
+            text_marker.text = f"WP{i}\n({waypoint[0]:.2f}, {waypoint[1]:.2f}, {waypoint[2]:.2f})"
+
+            self.marker_publisher.publish(text_marker)
+
+        # Final destination 마커들
+        # 타원 마커
+        final_sphere = Marker()
+        final_sphere.header.frame_id = "map"
+        final_sphere.header.stamp = self.get_clock().now().to_msg()
+        final_sphere.ns = "final_sphere"
+        final_sphere.id = 0
+        final_sphere.type = Marker.SPHERE
+        final_sphere.action = Marker.ADD
+
+        final_sphere.pose.position.x = self.final_destination[0]
+        final_sphere.pose.position.y = self.final_destination[1]
+        final_sphere.pose.position.z = self.final_destination[2]
+        final_sphere.pose.orientation.w = 1.0
+
+        final_sphere.scale.x = 3.0
+        final_sphere.scale.y = 3.0
+        final_sphere.scale.z = 1.0
+
+        # Final destination은 골드색
+        final_sphere.color.r = 1.0
+        final_sphere.color.g = 0.8
+        final_sphere.color.b = 0.0
+        final_sphere.color.a = 0.7
+
+        self.marker_publisher.publish(final_sphere)
+
+        # 실린더 마커
+        final_cylinder = Marker()
+        final_cylinder.header.frame_id = "map"
+        final_cylinder.header.stamp = self.get_clock().now().to_msg()
+        final_cylinder.ns = "final_cylinder"
+        final_cylinder.id = 0
+        final_cylinder.type = Marker.CYLINDER
+        final_cylinder.action = Marker.ADD
+
+        final_cylinder.pose.position.x = self.final_destination[0]
+        final_cylinder.pose.position.y = self.final_destination[1]
+        final_cylinder.pose.position.z = self.final_destination[2] + 1.5
+        final_cylinder.pose.orientation.w = 1.0
+
+        final_cylinder.scale.x = 0.5
+        final_cylinder.scale.y = 0.5
+        final_cylinder.scale.z = 3.0
+
+        final_cylinder.color.r = 1.0
+        final_cylinder.color.g = 0.8
+        final_cylinder.color.b = 0.0
+        final_cylinder.color.a = 0.7
+
+        self.marker_publisher.publish(final_cylinder)
+
+        # Final destination 텍스트 마커
+        final_text = Marker()
+        final_text.header.frame_id = "map"
+        final_text.header.stamp = self.get_clock().now().to_msg()
+        final_text.ns = "final_text"
+        final_text.id = 0
+        final_text.type = Marker.TEXT_VIEW_FACING
+        final_text.action = Marker.ADD
+
+        # 텍스트를 마커 아래쪽에 위치
+        final_text.pose.position.x = self.final_destination[0]
+        final_text.pose.position.y = self.final_destination[1]
+        final_text.pose.position.z = self.final_destination[2] - 1.0
+        final_text.pose.orientation.w = 1.0
+
+        # 텍스트 크기
+        final_text.scale.z = 0.8
+
+        # 텍스트 색상 (흰색)
+        final_text.color.r = 1.0
+        final_text.color.g = 1.0
+        final_text.color.b = 1.0
+        final_text.color.a = 1.0
+
+        # 텍스트 내용
+        final_text.text = f"FINAL\n({self.final_destination[0]:.2f}, {self.final_destination[1]:.2f}, {self.final_destination[2]:.2f})"
+
+        self.marker_publisher.publish(final_text)
+
     def check_arrival(self, tolerance=1.5):
         if self.current_map_pose is None: return False
         pos = self.current_map_pose.pose.position
@@ -344,6 +547,8 @@ class InteractiveMissionNode(Node):
         # <<< CHANGE: 'stare' 모드 실행 로직 추가 >>>
         if self.stare_target_index is not None and self.state in ["IDLE", "MOVING"]:
             self.point_gimbal_at_target(self.stare_target_index)
+
+        self.publish_all_markers()
 
         state_msg = String(data=self.state)
         self.state_publisher.publish(state_msg)

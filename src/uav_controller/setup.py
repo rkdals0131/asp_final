@@ -22,7 +22,7 @@ setup(
         'console_scripts': [
             'offboard_control = uav_controller.offboard_control_mission:main',
             'offboard_control_abscoord_test = uav_controller.offboard_control_abscoord_test:main',
-            'offboard_control_mission_traverse = uav_controller.offboard_control_abscoord_traversal_test:main',
+            'offboard_control_mission_traverse = uav_controller.offboard_control_abscoord_traversal:main',
             'offboard_control_mission_flythrough = uav_controller.offboard_control_abscoord_flythrough:main',
         ],
     },
