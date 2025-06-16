@@ -7,6 +7,8 @@ from rcl_interfaces.msg import ParameterDescriptor
 from geometry_msgs.msg import Twist, Pose, PoseStamped
 from nav_msgs.msg import Path, Odometry
 from visualization_msgs.msg import Marker, MarkerArray
+from std_msgs.msg import String
+from mission_admin_interfaces.srv import MissionComplete
 
 import tf2_ros
 from tf2_ros import TransformException
@@ -95,9 +97,17 @@ class PathFollowerNode(Node):
         self.waypoint_marker_pub = self.create_publisher(MarkerArray, '/waypoint_markers', latched_qos)
         self.speed_marker_pub = self.create_publisher(MarkerArray, '/speed_markers', latched_qos)
         self.lookahead_marker_pub = self.create_publisher(Marker, '/lookahead_marker', 10)
+        self.state_pub = self.create_publisher(String, '/vehicle/state', 10)
+        
         self.odom_sub = self.create_subscription(Odometry, '/model/X1/odometry', self.odom_callback, 10)
+        self.mission_command_sub = self.create_subscription(String, '/ugv/mission_command', self.mission_command_callback, 10)
+        
+        # 미션 컨트롤 서비스 클라이언트
+        self.mission_complete_client = self.create_client(MissionComplete, '/mission_complete')
+        
         self.control_timer = self.create_timer(0.05, self.control_loop)
         self.path_update_timer = self.create_timer(0.2, self.update_full_path_and_velocity)
+        self.state_timer = self.create_timer(0.1, self.publish_state)
         self.input_thread = threading.Thread(target=self._command_input_loop, daemon=True)
         self.input_thread.start()
         
@@ -105,6 +115,58 @@ class PathFollowerNode(Node):
 
     def odom_callback(self, msg: Odometry):
         self.current_speed = msg.twist.twist.linear.x
+
+    def mission_command_callback(self, msg: String):
+        """미션 컨트롤 대시보드로부터 명령 수신"""
+        command = msg.data.lower()
+        if command == 'go' and self.is_waiting_for_go:
+            self.is_waiting_for_go = False
+            self.path_update_timer.cancel()
+            self.get_logger().info("🚀 미션 컨트롤로부터 GO 명령 수신. 미션 시작!")
+        elif command == 'resume' and self.is_mission_paused:
+            self._resume_mission()
+        elif command == 'stop':
+            self._stop_vehicle()
+            self.is_mission_paused = True
+            self.get_logger().info("⛔ 미션 컨트롤로부터 STOP 명령 수신")
+
+    def publish_state(self):
+        """현재 상태를 퍼블리시"""
+        if self.is_waiting_for_go:
+            state = "WAITING_FOR_GO"
+        elif self.is_mission_paused:
+            state = "PAUSED"
+        elif self.is_mission_complete:
+            state = "COMPLETE"
+        elif self.is_orienting:
+            state = "ORIENTING"
+        else:
+            state = "MOVING"
+        
+        self.state_pub.publish(String(data=state))
+
+    def send_mission_complete(self, mission_id: int):
+        """미션 완료 신호를 미션 컨트롤에 전송"""
+        if not self.mission_complete_client.wait_for_service(timeout_sec=1.0):
+            self.get_logger().warn(f"미션 컨트롤 서비스를 찾을 수 없습니다 (ID: {mission_id}) - 서비스 없이 계속 진행")
+            return
+            
+        request = MissionComplete.Request()
+        request.mission_id = mission_id
+        
+        try:
+            future = self.mission_complete_client.call_async(request)
+            rclpy.spin_until_future_complete(self, future, timeout_sec=2.0)
+            
+            if future.result() is not None:
+                if future.result().success:
+                    self.get_logger().info(f"✅ 미션 완료 신호 전송 성공 (ID: {mission_id})")
+                else:
+                    self.get_logger().warn(f"⚠️ 미션 완료 신호 거부됨 (ID: {mission_id}) - 계속 진행")
+            else:
+                self.get_logger().warn(f"⚠️ 미션 완료 신호 전송 타임아웃 (ID: {mission_id}) - 계속 진행")
+        except Exception as e:
+            self.get_logger().warn(f"⚠️ 미션 완료 신호 전송 실패 (ID: {mission_id}): {e} - 계속 진행")
 
     def _update_vehicle_pose(self):
         try:
@@ -131,11 +193,16 @@ class PathFollowerNode(Node):
             return
 
         if self.is_waiting_for_go or self.is_mission_complete or self.is_mission_paused:
+            # 디버깅: 왜 정지했는지 로그
+            if self.is_mission_paused:
+                self.get_logger().info("🔧 Debug: Vehicle stopped due to mission paused", throttle_duration_sec=5.0)
             self._stop_vehicle()
             return
             
         self._check_waypoint_arrival()
         if self.is_mission_paused or self.is_mission_complete:
+            if self.is_mission_paused:
+                self.get_logger().info("🔧 Debug: Mission paused after waypoint check", throttle_duration_sec=2.0)
             return
 
         current_x, current_y, current_yaw = self.vehicle_pose_map
@@ -198,15 +265,23 @@ class PathFollowerNode(Node):
             return
         dist = math.hypot(self.vehicle_pose_map[0] - wp_x, self.vehicle_pose_map[1] - wp_y)
         
+        # 디버깅 로그 추가 (웨이포인트 2 근처에서만)
+        if self.current_waypoint_idx == 2:
+            self.get_logger().info(f"🔍 Debug: WP2 거리체크 - 현재위치:({self.vehicle_pose_map[0]:.2f}, {self.vehicle_pose_map[1]:.2f}), 목표:({wp_x:.2f}, {wp_y:.2f}), 거리:{dist:.2f}m, 임계값:{self.REACH_THRESHOLD}m", throttle_duration_sec=2.0)
+        
         if dist < self.REACH_THRESHOLD:
-            self.get_logger().info(f"✅ Waypoint {self.current_waypoint_idx} reached.")
+            self.get_logger().info(f"✅ Waypoint {self.current_waypoint_idx} reached (distance: {dist:.2f}m).")
             if wp_mission == 2:
                 self.is_mission_paused = True
                 self.get_logger().info("🚁 Drone takeoff point reached. Vehicle paused.")
-                print("\n>>> Type 'resume' to continue after drone departure.")
+                self.get_logger().info(f"🔧 Debug: is_mission_paused set to {self.is_mission_paused}")
+                # 미션 컨트롤에 이륙 지점 도착 신호 전송
+                self.send_mission_complete(1)  # UGV_TAKEOFF_ARRIVAL
             elif wp_mission == 4:
                 self.is_mission_complete = True
                 self.get_logger().info("🏁 Mission completed!")
+                # 미션 컨트롤에 UGV 미션 완료 신호 전송
+                self.send_mission_complete(3)  # UGV_MISSION_COMPLETE
             self.current_waypoint_idx += 1
             self.last_closest_idx = self._find_closest_point_idx(self.vehicle_pose_map[0], self.vehicle_pose_map[1])
 

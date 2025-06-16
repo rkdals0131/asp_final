@@ -21,6 +21,8 @@ setup(
     entry_points={
         'console_scripts': [
             'dashboard = monitoring_board.dashboard:main',
+            'mission_control = monitoring_board.mission_control_dashboard:main',
+            'simple_mission_control = monitoring_board.simple_mission_control:main',
         ],
     },
 )

@@ -16,6 +16,7 @@ from px4_msgs.msg import OffboardControlMode, TrajectorySetpoint, VehicleCommand
 from geometry_msgs.msg import PoseStamped, Point
 from std_msgs.msg import String, ColorRGBA
 from visualization_msgs.msg import Marker, MarkerArray
+from mission_admin_interfaces.srv import MissionComplete
 
 # --- TF2 관련 모듈 임포트 ---
 from tf2_ros import TransformException
@@ -55,6 +56,10 @@ class WaypointMissionNode(Node):
 
         self.local_position_subscriber = self.create_subscription(VehicleLocalPosition, "/fmu/out/vehicle_local_position", self.local_position_callback, qos_profile)
         self.attitude_subscriber = self.create_subscription(VehicleAttitude, "/fmu/out/vehicle_attitude", self.attitude_callback, qos_profile)
+        self.mission_command_sub = self.create_subscription(String, "/drone/mission_command", self.mission_command_callback, 10)
+        
+        # 미션 컨트롤 서비스 클라이언트
+        self.mission_complete_client = self.create_client(MissionComplete, '/mission_complete')
 
         # --- TF 설정 ---
         self.tf_buffer = Buffer()
@@ -99,21 +104,58 @@ class WaypointMissionNode(Node):
 
     def command_input_loop(self):
         print("\n--- Waypoint Mission Command ---")
-        print("  start   - Arm and start the mission")
-        print("  land    - Force landing")
+        print("  start   - ARM 후 미션 시작")
+        print("  land    - 강제 착륙")
         print("--------------------------------")
         for line in sys.stdin:
             cmd = line.strip().lower()
             if cmd == "start":
-                if self.state == "ARMED_IDLE":
-                    self.get_logger().info("User command: START. Taking off.")
-                    self.state = "TAKING_OFF"
+                if self.state == "INIT":
+                    self.get_logger().info("사용자 명령: START. ARM 후 이륙 시작.")
+                    self.state = "HANDSHAKE"
                 else:
-                    self.get_logger().warn(f"Cannot start mission from state: {self.state}")
+                    self.get_logger().warn(f"START 명령을 사용할 수 없는 상태입니다: {self.state}")
             elif cmd == "land":
                  if self.state not in ["LANDING", "LANDED"]:
-                     self.get_logger().warn("User command: LAND. Forcing landing.")
+                     self.get_logger().warn("사용자 명령: LAND. 강제 착륙.")
                      self.state = "LANDING"
+
+    def mission_command_callback(self, msg: String):
+        """미션 컨트롤 대시보드로부터 명령 수신"""
+        command = msg.data.lower()
+        if command == 'start':
+            if self.state == "INIT":
+                self.get_logger().info("🚁 미션 컨트롤로부터 START 명령 수신. ARM 및 이륙 시작")
+                self.state = "HANDSHAKE"
+            else:
+                self.get_logger().warn(f"START 명령을 받았지만 현재 상태가 {self.state}입니다. INIT 상태에서만 시작 가능합니다.")
+        elif command == 'land':
+            if self.state not in ["LANDING", "LANDED"]:
+                self.get_logger().info("⛔ 미션 컨트롤로부터 LAND 명령 수신")
+                self.state = "LANDING"
+
+    def send_mission_complete(self, mission_id: int):
+        """미션 완료 신호를 미션 컨트롤에 전송"""
+        if not self.mission_complete_client.wait_for_service(timeout_sec=1.0):
+            self.get_logger().warn(f"미션 컨트롤 서비스를 찾을 수 없습니다 (ID: {mission_id}) - 서비스 없이 계속 진행")
+            return
+            
+        request = MissionComplete.Request()
+        request.mission_id = mission_id
+        
+        try:
+            future = self.mission_complete_client.call_async(request)
+            rclpy.spin_until_future_complete(self, future, timeout_sec=2.0)
+            
+            if future.result() is not None:
+                if future.result().success:
+                    self.get_logger().info(f"✅ 미션 완료 신호 전송 성공 (ID: {mission_id})")
+                else:
+                    self.get_logger().warn(f"⚠️ 미션 완료 신호 거부됨 (ID: {mission_id}) - 계속 진행")
+            else:
+                self.get_logger().warn(f"⚠️ 미션 완료 신호 전송 타임아웃 (ID: {mission_id}) - 계속 진행")
+        except Exception as e:
+            self.get_logger().warn(f"⚠️ 미션 완료 신호 전송 실패 (ID: {mission_id}): {e} - 계속 진행")
 
     def local_position_callback(self, msg: VehicleLocalPosition): self.current_local_pos = msg
     def attitude_callback(self, msg: VehicleAttitude): self.current_attitude = msg
@@ -296,21 +338,17 @@ class WaypointMissionNode(Node):
              self.publish_offboard_control_mode()
 
         if self.state == "INIT":
-            self.get_logger().info("System ready, starting handshake.", once=True)
-            self.state = "HANDSHAKE"
+            self.get_logger().info("✅ 시스템 준비 완료. START 명령을 기다리는 중...", once=True)
+            # 더 이상 자동으로 HANDSHAKE로 넘어가지 않음
 
         elif self.state == "HANDSHAKE":
             self.publish_vehicle_command(VehicleCommand.VEHICLE_CMD_DO_SET_MODE, param1=1.0, param2=6.0)
             self.publish_vehicle_command(VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM, param1=1.0)
             self.handshake_counter += 1
             if self.handshake_counter > self.handshake_duration:
-                self.get_logger().info("Arm command sent. Ready for 'start' command.")
-                self.state = "ARMED_IDLE"
+                self.get_logger().info("🔧 ARM 명령 전송 완료. 이륙 시작.")
+                self.state = "TAKING_OFF"
         
-        elif self.state == "ARMED_IDLE":
-            if self.current_map_pose:
-                self.publish_position_setpoint([self.current_map_pose.pose.position.x, self.current_map_pose.pose.position.y, self.current_map_pose.pose.position.z])
-
         elif self.state == "TAKING_OFF":
             if self.current_map_pose:
                 takeoff_altitude = self.drone_waypoints[0][2]
@@ -318,7 +356,9 @@ class WaypointMissionNode(Node):
                 self.publish_position_setpoint(target_pos)
             
                 if abs(self.current_map_pose.pose.position.z - takeoff_altitude) < 1.0:
-                    self.get_logger().info(f"Takeoff complete. Moving to first waypoint {self.current_waypoint_index}.")
+                    self.get_logger().info(f"🚁 이륙 완료. 첫 번째 웨이포인트 {self.current_waypoint_index}로 이동.")
+                    # 미션 컨트롤에 이륙 완료 신호 전송
+                    self.send_mission_complete(2)  # DRONE_TAKEOFF_COMPLETE
                     self.state = "MOVING_TO_WAYPOINT"
 
         elif self.state == "MOVING_TO_WAYPOINT":
@@ -352,12 +392,24 @@ class WaypointMissionNode(Node):
             if self.get_clock().now() - self.hover_start_time > rclpy.duration.Duration(seconds=2):
                 self.current_waypoint_index += 1
                 if self.current_waypoint_index >= len(self.drone_waypoints):
-                    self.get_logger().info("All waypoints visited. Mission complete.")
-                    self.state = "LANDING"
+                    self.get_logger().info("🏁 모든 웨이포인트 방문 완료. 현재 위치에서 호버링 시작.")
+                    self.state = "MISSION_COMPLETE_HOVER"
+                    # 미션 컨트롤에 랑데뷰 지점 도착 및 호버링 완료 신호 전송
+                    self.send_mission_complete(4)  # DRONE_APPROACH_COMPLETE
+                    self.send_mission_complete(5)  # DRONE_HOVER_COMPLETE
                 else:
                     self.get_logger().info(f"Hover complete. Moving to next waypoint: {self.current_waypoint_index}")
                     self.state = "MOVING_TO_WAYPOINT"
                 self.hover_start_time = None
+        
+        elif self.state == "MISSION_COMPLETE_HOVER":
+            # 마지막 웨이포인트에서 계속 호버링 (무한 호버링)
+            final_wp = self.drone_waypoints[-1]
+            final_stare_idx = self.stare_indices[-1]
+            final_stare_pos = self.stare_targets[final_stare_idx]
+            self.publish_position_setpoint(final_wp)
+            self.point_gimbal_at_target(final_stare_pos)
+            self.get_logger().info("✈️ 미션 완료 - 마지막 웨이포인트에서 호버링 중...", throttle_duration_sec=10.0)
         
         elif self.state == "LANDING":
             self.get_logger().info("Landing command issued.", throttle_duration_sec=5)
