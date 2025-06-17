@@ -1,6 +1,6 @@
 from setuptools import find_packages, setup
 
-package_name = 'uav_controller'
+package_name = 'robot_control'
 
 setup(
     name=package_name,
@@ -11,17 +11,15 @@ setup(
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
     ],
-    install_requires=['setuptools', 'px4_msgs'],
+    install_requires=['setuptools'],
     zip_safe=True,
     maintainer='user1',
     maintainer_email='kikiws70@gmail.com',
-    description='UAV Controller package for PX4 offboard control',
-    license='Apache License 2.0',
+    description='TODO: Package description',
+    license='TODO: License declaration',
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'interactive_mission = uav_controller.interactive_mission:main',
-            'waypoint_mission = uav_controller.waypoint_mission:main',
         ],
     },
 )
