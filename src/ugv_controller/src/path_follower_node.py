@@ -18,12 +18,14 @@ import numpy as np
 from scipy.interpolate import splprep, splev
 import threading
 import sys
-import time
+import os
+import yaml
 
 class PathFollowerNode(Node):
     """
     S-Curve 속도 프로파일 기반 경로 추종 노드
     - 드론 탑재 여부에 따라 저크(Jerk)와 가속도를 동적으로 제어하여 최적화된 주행 구현
+    - 경로 완료 시 미션 컨트롤에 신호 전송 (경로의 의미는 해석하지 않음)
     """
     def __init__(self):
         super().__init__('path_follower_advanced')
@@ -49,6 +51,12 @@ class PathFollowerNode(Node):
         self.declare_parameter('path_density', 0.1, ParameterDescriptor(description="경로점 생성 간격 (m)"))
         self.declare_parameter('map_frame', 'map', ParameterDescriptor(description="맵 TF 프레임"))
         self.declare_parameter('vehicle_base_frame', 'X1_asp/base_link', ParameterDescriptor(description="차량 기준 TF 프레임"))
+        
+        # === 경로 로딩 파라미터 ===
+        self.declare_parameter('waypoint_file', '', 
+            ParameterDescriptor(description="웨이포인트 파일 경로 (YAML/CSV). 비어있으면 기본 경로 사용"))
+        self.declare_parameter('use_mission_ids', True, 
+            ParameterDescriptor(description="미션 ID 기반 완료 신호 전송 여부"))
 
         # 파라미터 로딩
         self.MAX_JERK_WITH_DRONE = self.get_parameter('max_jerk_with_drone').value
@@ -67,6 +75,9 @@ class PathFollowerNode(Node):
         self.PATH_DENSITY = self.get_parameter('path_density').value
         self.MAP_FRAME = self.get_parameter('map_frame').value
         self.VEHICLE_BASE_FRAME = self.get_parameter('vehicle_base_frame').value
+        
+        self.waypoint_file = self.get_parameter('waypoint_file').value
+        self.use_mission_ids = self.get_parameter('use_mission_ids').value
 
         # 상태 변수
         self.vehicle_pose_map = None
@@ -82,9 +93,20 @@ class PathFollowerNode(Node):
 
         # 경로 데이터
         self.raw_waypoints = self._load_waypoints()
+        if not self.raw_waypoints:
+            self.get_logger().error("❌ 웨이포인트 로드 실패. 노드 종료.")
+            return
+            
         self.main_path_points = self._generate_path_points_from_list(self.raw_waypoints)
         self.full_path_points = []
         self.full_target_velocities = []
+
+        # === 미션 완료 신호 매핑 ===
+        # 미션의 구체적 의미를 모르고, 단순히 웨이포인트 인덱스별로 신호만 전송
+        self.waypoint_mission_mapping = {
+            2: 1,  # 3번째 웨이포인트 (인덱스 2) -> 미션 ID 1
+            len(self.raw_waypoints) - 1: 3  # 마지막 웨이포인트 -> 미션 ID 3
+        }
 
         # TF 및 통신
         self.tf_buffer = tf2_ros.Buffer()
@@ -111,7 +133,10 @@ class PathFollowerNode(Node):
         self.input_thread = threading.Thread(target=self._command_input_loop, daemon=True)
         self.input_thread.start()
         
-        self.get_logger().info("🚗 S-Curve Path Follower initialized. Current mode: [With Drone]. Type 'go' to start.")
+        self.get_logger().info("🚗 S-Curve Path Follower v4.0 초기화 완료")
+        self.get_logger().info(f"   - 웨이포인트 파일: {self.waypoint_file if self.waypoint_file else '기본 경로'}")
+        self.get_logger().info(f"   - 로드된 웨이포인트: {len(self.raw_waypoints)}개")
+        self.get_logger().info("   - 현재 모드: [With Drone]. 'go' 명령 대기 중")
 
     def odom_callback(self, msg: Odometry):
         self.current_speed = msg.twist.twist.linear.x
@@ -147,6 +172,10 @@ class PathFollowerNode(Node):
 
     def send_mission_complete(self, mission_id: int):
         """미션 완료 신호를 미션 컨트롤에 전송"""
+        if not self.use_mission_ids:
+            self.get_logger().info(f"📡 미션 완료 신호 전송 비활성화됨 (ID: {mission_id})")
+            return
+            
         if not self.mission_complete_client.wait_for_service(timeout_sec=1.0):
             self.get_logger().warn(f"미션 컨트롤 서비스를 찾을 수 없습니다 (ID: {mission_id}) - 서비스 없이 계속 진행")
             return
@@ -250,38 +279,51 @@ class PathFollowerNode(Node):
         initial_path = self._generate_straight_path((start_x, start_y), (goal_x, goal_y))
         
         self.full_path_points = initial_path + self.main_path_points
-        final_mission, final_speed = self.raw_waypoints[-1][2], self.raw_waypoints[-1][3]
-        end_vel = 0.0 if final_mission == 4 else float(final_speed)
+        
+        # 마지막 웨이포인트의 타입에 따라 종료 속도 결정
+        final_waypoint = self.raw_waypoints[-1]
+        end_vel = 0.0 if len(final_waypoint) > 2 and final_waypoint[2] == 4 else 0.0  # 안전을 위해 항상 0으로 종료
+        
         self.full_target_velocities = self._generate_scurve_velocity_profile(
             self.full_path_points, start_vel=self.current_speed, end_vel=end_vel)
         self._publish_path_visualization()
 
     def _check_waypoint_arrival(self):
+        """웨이포인트 도달 확인 - 역할 단순화"""
         if self.current_waypoint_idx >= len(self.raw_waypoints):
             return
             
-        wp_x, wp_y, wp_mission, _ = self.raw_waypoints[self.current_waypoint_idx]
+        waypoint = self.raw_waypoints[self.current_waypoint_idx]
+        wp_x, wp_y = waypoint[0], waypoint[1]
+        
         if self.vehicle_pose_map is None:
             return
+            
         dist = math.hypot(self.vehicle_pose_map[0] - wp_x, self.vehicle_pose_map[1] - wp_y)
         
-        # 디버깅 로그 추가 (웨이포인트 2 근처에서만)
+        # 특정 웨이포인트에서만 디버깅 로그 출력
         if self.current_waypoint_idx == 2:
-            self.get_logger().info(f"🔍 Debug: WP2 거리체크 - 현재위치:({self.vehicle_pose_map[0]:.2f}, {self.vehicle_pose_map[1]:.2f}), 목표:({wp_x:.2f}, {wp_y:.2f}), 거리:{dist:.2f}m, 임계값:{self.REACH_THRESHOLD}m", throttle_duration_sec=2.0)
+            self.get_logger().info(f"🔍 Debug: WP{self.current_waypoint_idx} 거리체크 - 현재위치:({self.vehicle_pose_map[0]:.2f}, {self.vehicle_pose_map[1]:.2f}), 목표:({wp_x:.2f}, {wp_y:.2f}), 거리:{dist:.2f}m, 임계값:{self.REACH_THRESHOLD}m", throttle_duration_sec=2.0)
         
         if dist < self.REACH_THRESHOLD:
             self.get_logger().info(f"✅ Waypoint {self.current_waypoint_idx} reached (distance: {dist:.2f}m).")
-            if wp_mission == 2:
-                self.is_mission_paused = True
-                self.get_logger().info("🚁 Drone takeoff point reached. Vehicle paused.")
-                self.get_logger().info(f"🔧 Debug: is_mission_paused set to {self.is_mission_paused}")
-                # 미션 컨트롤에 이륙 지점 도착 신호 전송
-                self.send_mission_complete(1)  # UGV_TAKEOFF_ARRIVAL
-            elif wp_mission == 4:
-                self.is_mission_complete = True
-                self.get_logger().info("🏁 Mission completed!")
-                # 미션 컨트롤에 UGV 미션 완료 신호 전송
-                self.send_mission_complete(3)  # UGV_MISSION_COMPLETE
+            
+            # 특정 웨이포인트에서만 처리 (기존 로직 유지)
+            if len(waypoint) > 2:  # 미션 타입 정보가 있는 경우
+                mission_type = waypoint[2]
+                if mission_type == 2:  # 드론 이륙 지점
+                    self.is_mission_paused = True
+                    self.get_logger().info("🚁 Drone takeoff point reached. Vehicle paused.")
+                    self.get_logger().info(f"🔧 Debug: is_mission_paused set to {self.is_mission_paused}")
+                elif mission_type == 4:  # 최종 목적지
+                    self.is_mission_complete = True
+                    self.get_logger().info("🏁 Mission completed!")
+            
+            # 미션 완료 신호 전송 (매핑 테이블 사용)
+            if self.current_waypoint_idx in self.waypoint_mission_mapping:
+                mission_id = self.waypoint_mission_mapping[self.current_waypoint_idx]
+                self.send_mission_complete(mission_id)
+            
             self.current_waypoint_idx += 1
             self.last_closest_idx = self._find_closest_point_idx(self.vehicle_pose_map[0], self.vehicle_pose_map[1])
 
@@ -358,9 +400,23 @@ class PathFollowerNode(Node):
         distances = self._calculate_path_distances(path_points)
         velocity_limits = self._calculate_curvature_limited_velocities([p[0] for p in path_points], [p[1] for p in path_points])
         
-        for wp_x, wp_y, m_type, t_speed in self.raw_waypoints:
+        # 웨이포인트 기반 속도 제한 적용
+        for i, waypoint in enumerate(self.raw_waypoints):
+            wp_x, wp_y = waypoint[0], waypoint[1]
             closest_idx = min(range(num_points), key=lambda i: math.hypot(path_points[i][0] - wp_x, path_points[i][1] - wp_y))
-            wp_vel = 0.0 if m_type in [2, 4] else (self.MAX_SPEED if t_speed < 0 else np.clip(t_speed, self.MIN_SPEED, self.MAX_SPEED))
+            
+            # 웨이포인트 타입별 속도 설정
+            if len(waypoint) > 3:
+                target_speed = waypoint[3]
+                if len(waypoint) > 2 and waypoint[2] in [2, 4]:  # 정지 지점
+                    wp_vel = 0.0
+                elif target_speed < 0:  # 최대 속도
+                    wp_vel = self.MAX_SPEED
+                else:
+                    wp_vel = np.clip(target_speed, self.MIN_SPEED, self.MAX_SPEED)
+            else:
+                wp_vel = self.MAX_SPEED
+            
             velocity_limits[closest_idx] = min(velocity_limits[closest_idx], wp_vel)
         
         trapezoidal_profile = list(velocity_limits)
@@ -441,7 +497,6 @@ class PathFollowerNode(Node):
         for point in self.full_path_points:
             pose_stamped = PoseStamped()
             pose_stamped.header = path_msg.header
-            # [FIX] Correctly create Pose object
             pose = Pose()
             pose.position.x = point[0]
             pose.position.y = point[1]
@@ -455,7 +510,8 @@ class PathFollowerNode(Node):
 
     def _publish_waypoint_markers(self):
         marker_array = MarkerArray()
-        for i, (x, y, mission, target_speed) in enumerate(self.raw_waypoints):
+        for i, waypoint in enumerate(self.raw_waypoints):
+            x, y = waypoint[0], waypoint[1]
             marker = Marker()
             marker.header.frame_id = self.MAP_FRAME
             marker.ns = "waypoints"
@@ -468,14 +524,24 @@ class PathFollowerNode(Node):
             marker.pose.orientation.w = 1.0
             marker.scale.x = marker.scale.y = marker.scale.z = 1.5
             
-            if mission == 2:
-                marker.color.r, marker.color.g, marker.color.b = 1.0, 1.0, 0.0  # Yellow
-            elif mission == 4:
-                marker.color.r, marker.color.g, marker.color.b = 1.0, 0.0, 0.0  # Red
-            elif target_speed > 0 and target_speed <= 1.0:
-                marker.color.r, marker.color.g, marker.color.b = 1.0, 0.5, 0.0  # Orange
+            # 웨이포인트 타입별 색상 (타입 정보가 있는 경우)
+            if len(waypoint) > 2:
+                mission_type = waypoint[2]
+                if mission_type == 2:
+                    marker.color.r, marker.color.g, marker.color.b = 1.0, 1.0, 0.0  # Yellow
+                elif mission_type == 4:
+                    marker.color.r, marker.color.g, marker.color.b = 1.0, 0.0, 0.0  # Red
+                else:
+                    marker.color.r, marker.color.g, marker.color.b = 0.0, 0.0, 1.0  # Blue
             else:
                 marker.color.r, marker.color.g, marker.color.b = 0.0, 0.0, 1.0  # Blue
+                
+            # 속도 정보에 따른 색상 조정
+            if len(waypoint) > 3:
+                target_speed = waypoint[3]
+                if 0 < target_speed <= 1.0:
+                    marker.color.r, marker.color.g, marker.color.b = 1.0, 0.5, 0.0  # Orange
+                    
             marker.color.a = 0.8
             marker_array.markers.append(marker)
         self.waypoint_marker_pub.publish(marker_array)
@@ -556,15 +622,91 @@ class PathFollowerNode(Node):
         self.lookahead_marker_pub.publish(marker)
 
     def _load_waypoints(self):
+        """웨이포인트 로드 - 파일 또는 기본값"""
+        # 파일에서 로드 시도
+        if self.waypoint_file:
+            try:
+                waypoints = self._load_waypoints_from_file(self.waypoint_file)
+                if waypoints:
+                    self.get_logger().info(f"✅ 웨이포인트 파일 로드 성공: {self.waypoint_file}")
+                    return waypoints
+                else:
+                    self.get_logger().warn(f"⚠️ 웨이포인트 파일이 비어있음: {self.waypoint_file}")
+            except Exception as e:
+                self.get_logger().error(f"❌ 웨이포인트 파일 로드 실패: {e}")
+                self.get_logger().info("기본 웨이포인트 사용")
+        
+        # 기본 웨이포인트 반환
         return [
             (-130.04, 51.88, 1, -1.0),
             (-132.71, 58.04, 1, -1.0),
-            (-132.87, 64.00, 2, 0.0),
+            (-132.87, 64.00, 2, 0.0),  # 드론 이륙 지점
             (-129.23, 69.36, 3, -1.0), (-120.85, 73.20, 3, -1.0), (-117.45, 73.15, 3, -1.0),
             (-113.63, 72.64, 3, -1.0), (-104.97, 77.01, 3, -1.0), (-94.75, 84.41, 3, -1.0),
             (-91.71, 86.98, 3, -1.0), (-80.82, 97.95, 3, -1.0), (-76.74, 99.61, 3, 1.0),
-            (-73.90, 98.63, 3, 1.0), (-72.13, 98.65, 3, 1.0), (-62.96, 99.09, 4, 0.0)
+            (-73.90, 98.63, 3, 1.0), (-72.13, 98.65, 3, 1.0), (-62.96, 99.09, 4, 0.0)  # 최종 목적지
         ]
+
+    def _load_waypoints_from_file(self, file_path):
+        """파일에서 웨이포인트 로드 (YAML 또는 CSV)"""
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"파일을 찾을 수 없습니다: {file_path}")
+        
+        _, ext = os.path.splitext(file_path.lower())
+        
+        if ext == '.yaml' or ext == '.yml':
+            return self._load_waypoints_from_yaml(file_path)
+        elif ext == '.csv':
+            return self._load_waypoints_from_csv(file_path)
+        else:
+            raise ValueError(f"지원하지 않는 파일 형식: {ext}")
+
+    def _load_waypoints_from_yaml(self, file_path):
+        """YAML 파일에서 웨이포인트 로드"""
+        with open(file_path, 'r') as f:
+            data = yaml.safe_load(f)
+        
+        if 'waypoints' not in data:
+            raise ValueError("YAML 파일에 'waypoints' 키가 없습니다")
+        
+        waypoints = []
+        for wp in data['waypoints']:
+            x = float(wp['x'])
+            y = float(wp['y'])
+            mission_type = wp.get('mission_type', 1)
+            target_speed = wp.get('target_speed', -1.0)
+            waypoints.append((x, y, mission_type, target_speed))
+        
+        return waypoints
+
+    def _load_waypoints_from_csv(self, file_path):
+        """CSV 파일에서 웨이포인트 로드"""
+        import csv
+        waypoints = []
+        
+        with open(file_path, 'r') as f:
+            reader = csv.reader(f)
+            # 헤더 건너뛰기 (첫 번째 행이 헤더인 경우)
+            first_row = next(reader)
+            if not first_row[0].replace('-', '').replace('.', '').isdigit():
+                pass  # 헤더였음
+            else:
+                # 첫 번째 행이 데이터였음
+                x, y = float(first_row[0]), float(first_row[1])
+                mission_type = int(first_row[2]) if len(first_row) > 2 else 1
+                target_speed = float(first_row[3]) if len(first_row) > 3 else -1.0
+                waypoints.append((x, y, mission_type, target_speed))
+            
+            # 나머지 행 처리
+            for row in reader:
+                if len(row) < 2:
+                    continue
+                x, y = float(row[0]), float(row[1])
+                mission_type = int(row[2]) if len(row) > 2 else 1
+                target_speed = float(row[3]) if len(row) > 3 else -1.0
+                waypoints.append((x, y, mission_type, target_speed))
+        
+        return waypoints
 
     def _quat_to_euler(self, q):
         t3 = 2.0 * (q.w * q.z + q.x * q.y)

@@ -4,6 +4,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.parameter import Parameter
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
+from rcl_interfaces.msg import ParameterDescriptor
 
 # --- 메시지 타입 임포트 ---
 from px4_msgs.msg import VehicleLocalPosition
@@ -20,17 +21,62 @@ from tf2_ros.transform_listener import TransformListener
 import os
 import datetime
 import math
+import re
 
 class UAVDashboard(Node):
     """
     드론과 차량의 시스템 상태, 임무 정보, 원격측정 데이터를
     하나의 터미널에 실시간으로 표시하는 통합 대시보드 노드.
-    미션 진행 상태도 모니터링합니다.
+    순수한 시각화 담당으로 완성된 상태 정보만 표시합니다.
     """
 
     def __init__(self):
         super().__init__('uav_dashboard_node')
         self.set_parameters([Parameter('use_sim_time', value=True)])
+
+        # === 파라미터 선언 ===
+        self.declare_parameter('px4_local_pos_topic', '/fmu/out/vehicle_local_position',
+            ParameterDescriptor(description="PX4 로컬 위치 토픽"))
+        self.declare_parameter('vehicle_odom_topic', '/model/X1/odometry',
+            ParameterDescriptor(description="차량 오도메트리 토픽"))
+        self.declare_parameter('camera_image_topic', '/x500/image_proc',
+            ParameterDescriptor(description="카메라 이미지 토픽"))
+        self.declare_parameter('marker_detection_topic', '/marker_detections',
+            ParameterDescriptor(description="마커 감지 토픽"))
+        self.declare_parameter('drone_state_topic', '/drone/state',
+            ParameterDescriptor(description="드론 상태 토픽"))
+        self.declare_parameter('vehicle_state_topic', '/vehicle/state',
+            ParameterDescriptor(description="차량 상태 토픽"))
+        self.declare_parameter('mission_status_topic', '/mission/status',
+            ParameterDescriptor(description="미션 상태 토픽"))
+        
+        self.declare_parameter('drone_frame_id', 'x500_gimbal_0/base_link',
+            ParameterDescriptor(description="드론 TF 프레임 ID"))
+        self.declare_parameter('vehicle_frame_id', 'X1_asp/base_link',
+            ParameterDescriptor(description="차량 TF 프레임 ID"))
+        self.declare_parameter('map_frame', 'map',
+            ParameterDescriptor(description="맵 TF 프레임 ID"))
+        
+        self.declare_parameter('check_timeout', 2.0,
+            ParameterDescriptor(description="토픽 수신 타임아웃 (초)"))
+        self.declare_parameter('node_timeout', 5.0,
+            ParameterDescriptor(description="노드 활성화 체크 타임아웃 (초)"))
+
+        # 파라미터 값 로드
+        self.px4_topic = self.get_parameter('px4_local_pos_topic').value
+        self.vehicle_odom_topic = self.get_parameter('vehicle_odom_topic').value
+        self.camera_topic = self.get_parameter('camera_image_topic').value
+        self.marker_topic = self.get_parameter('marker_detection_topic').value
+        self.drone_state_topic = self.get_parameter('drone_state_topic').value
+        self.vehicle_state_topic = self.get_parameter('vehicle_state_topic').value
+        self.mission_status_topic = self.get_parameter('mission_status_topic').value
+        
+        self.drone_frame_id = self.get_parameter('drone_frame_id').value
+        self.vehicle_frame_id = self.get_parameter('vehicle_frame_id').value
+        self.map_frame = self.get_parameter('map_frame').value
+        
+        self.check_timeout = self.get_parameter('check_timeout').value
+        self.node_timeout = self.get_parameter('node_timeout').value
 
         # --- ANSI 색상 코드 ---
         self.COLOR_GREEN = '\033[92m'
@@ -42,20 +88,6 @@ class UAVDashboard(Node):
         self.COLOR_BOLD = '\033[1m'
         self.COLOR_END = '\033[0m'
 
-        # --- 미션 상태 정의 ---
-        self.MISSION_STATES = {
-            'INIT': '시스템 초기화 중',
-            'READY': '미션 시작 준비 완료',
-            'UGV_TO_TAKEOFF': 'UGV가 이륙 지점으로 이동 중',
-            'DRONE_ARMING': '드론 ARM 진행 중',
-            'DRONE_TAKEOFF': '드론 이륙 중',
-            'MISSION_ACTIVE': '미션 활성화 (양 플랫폼 이동)',
-            'DRONE_APPROACH': '드론 랑데뷰 지점 접근',
-            'DRONE_HOVER': '드론 최종 호버링',
-            'MISSION_COMPLETE': '미션 완료',
-            'MISSION_ABORT': '미션 중단'
-        }
-
         # --- 데이터 저장을 위한 멤버 변수 ---
         self.drone_local_pos = None     # GPS 기준점(ref) 및 속도 정보용
         self.vehicle_odom = None        # 차량 속도 정보용
@@ -65,24 +97,11 @@ class UAVDashboard(Node):
         self.drone_state = "INITIALIZING"
         self.vehicle_state = "INITIALIZING"
         
-        # --- 미션 상태 변수 ---
-        self.mission_state = "INIT"
+        # --- 미션 상태 변수 (단순히 받아서 표시만) ---
+        self.mission_status_raw = "INIT"  # 원본 상태 문자열
         self.mission_elapsed_time = 0.0
-        self.previous_mission_state = "INIT"
-        
-        # --- 미션 단계별 타이밍 추적 ---
-        self.mission_timings = {
-            'UGV_TO_TAKEOFF': {'start_time': None, 'duration': None},
-            'DRONE_ARMING': {'start_time': None, 'duration': None},
-            'DRONE_TAKEOFF': {'start_time': None, 'duration': None},
-            'MISSION_ACTIVE': {'start_time': None, 'duration': None},
-            'DRONE_APPROACH': {'start_time': None, 'duration': None},
-            'DRONE_HOVER': {'start_time': None, 'duration': None},
-            'MISSION_COMPLETE': {'start_time': None, 'duration': None}
-        }
 
         # --- Pre-flight Check를 위한 변수 ---
-        self.check_timeout = 2.0
         self.topic_last_seen = {
             'PX4_LOC_POS': 0.0,
             'VEHICLE_ODOM': 0.0,
@@ -99,11 +118,6 @@ class UAVDashboard(Node):
             'path_follower': False, 
             'offboard_control': False
         }
-
-        # TF 프레임 이름
-        self.drone_frame_id = "x500_gimbal_0/base_link"
-        self.vehicle_frame_id = "X1_asp/base_link"
-        self.map_frame = "map"
 
         # TF2 Listener 초기화
         self.tf_buffer = Buffer()
@@ -123,21 +137,19 @@ class UAVDashboard(Node):
             depth=10
         )
 
-        # --- Subscriber 초기화 ---
-        self.create_subscription(VehicleLocalPosition, "/fmu/out/vehicle_local_position", self.drone_local_pos_callback, qos_best_effort)
-        self.create_subscription(Odometry, "/model/X1/odometry", self.vehicle_odometry_callback, qos_reliable)
-        self.create_subscription(Image, "/x500/image_proc", self.camera_image_callback, qos_best_effort)
-        self.create_subscription(Detection3DArray, "/marker_detections", self.marker_detection_callback, qos_reliable)
-        self.create_subscription(String, "/drone/state", self.drone_state_callback, qos_reliable)
-        self.create_subscription(String, "/vehicle/state", self.vehicle_state_callback, qos_reliable)
-        
-        # --- 미션 상태 구독 ---
-        self.create_subscription(String, "/mission/status", self.mission_status_callback, qos_reliable)
+        # --- Subscriber 초기화 (파라미터 기반) ---
+        self.create_subscription(VehicleLocalPosition, self.px4_topic, self.drone_local_pos_callback, qos_best_effort)
+        self.create_subscription(Odometry, self.vehicle_odom_topic, self.vehicle_odometry_callback, qos_reliable)
+        self.create_subscription(Image, self.camera_topic, self.camera_image_callback, qos_best_effort)
+        self.create_subscription(Detection3DArray, self.marker_topic, self.marker_detection_callback, qos_reliable)
+        self.create_subscription(String, self.drone_state_topic, self.drone_state_callback, qos_reliable)
+        self.create_subscription(String, self.vehicle_state_topic, self.vehicle_state_callback, qos_reliable)
+        self.create_subscription(String, self.mission_status_topic, self.mission_status_callback, qos_reliable)
 
         # 30Hz 업데이트 타이머
         self.timer = self.create_timer(1.0 / 30.0, self.update_dashboard)
         
-        self.get_logger().info("UAV Telemetry Dashboard v2.3 is running.")
+        self.get_logger().info("UAV Telemetry Dashboard v3.0 초기화 완료 - 순수 시각화 모드")
 
     # --- 콜백 함수들 ---
     def get_current_time_sec(self):
@@ -168,38 +180,21 @@ class UAVDashboard(Node):
         self.node_status['path_follower'] = True
 
     def mission_status_callback(self, msg: String):
-        """미션 상태 콜백"""
+        """미션 상태 콜백 - 완성된 정보만 받아서 표시"""
         self.topic_last_seen['MISSION_STATUS'] = self.get_current_time_sec()
         self.node_status['mission_admin'] = True
-        current_time = self.get_current_time_sec()
         
         try:
-            # 메시지 형식: "STATE|elapsed_time"
+            # 메시지 형식: "STATE|elapsed_time" or "STATE"
             parts = msg.data.split('|')
-            if len(parts) == 2:
-                new_mission_state = parts[0]
+            if len(parts) >= 2:
+                self.mission_status_raw = parts[0]
                 self.mission_elapsed_time = float(parts[1])
             else:
-                new_mission_state = msg.data
+                self.mission_status_raw = msg.data
                 self.mission_elapsed_time = 0.0
-                
-            # 미션 상태 변경 감지 및 타이밍 기록
-            if new_mission_state != self.previous_mission_state:
-                # 이전 상태 완료 시간 기록
-                if self.previous_mission_state in self.mission_timings and self.mission_timings[self.previous_mission_state]['start_time'] is not None:
-                    self.mission_timings[self.previous_mission_state]['duration'] = current_time - self.mission_timings[self.previous_mission_state]['start_time']
-                
-                # 새 상태 시작 시간 기록
-                if new_mission_state in self.mission_timings:
-                    self.mission_timings[new_mission_state]['start_time'] = current_time
-                
-                self.previous_mission_state = self.mission_state
-                self.mission_state = new_mission_state
-            else:
-                self.mission_state = new_mission_state
-                
         except:
-            self.mission_state = msg.data
+            self.mission_status_raw = msg.data
             self.mission_elapsed_time = 0.0
 
     # --- 데이터 처리 및 포맷팅 ---
@@ -222,7 +217,7 @@ class UAVDashboard(Node):
         ENU 월드 좌표(map 기준)를 GPS 좌표로 변환합니다.
         PX4의 ref_lat/lon/alt를 기준점으로 사용합니다.
         """
-        if ref_lat == 0.0 or ref_lon == 0.0: # 유효한 기준점이 없을 경우
+        if ref_lat == 0.0 or ref_lon == 0.0:
             return None, None, None
             
         earth_radius = 6378137.0
@@ -234,7 +229,6 @@ class UAVDashboard(Node):
         
         new_lat = ref_lat + d_lat
         new_lon = ref_lon + d_lon
-        # <<< FIX: ENU의 z는 높이(Up)이므로 기준 고도에 더해줍니다. >>>
         new_alt = ref_alt + z
         
         return new_lat, new_lon, new_alt
@@ -247,14 +241,15 @@ class UAVDashboard(Node):
         return f"  {label:<18}: {self.COLOR_CYAN}{value}{self.COLOR_END} {unit}"
 
     def get_mission_status_color(self):
-        """미션 상태에 따른 색상 반환"""
-        if self.mission_state in ['MISSION_COMPLETE']:
+        """미션 상태에 따른 색상 반환 (간단한 키워드 기반)"""
+        status_lower = self.mission_status_raw.lower()
+        if 'complete' in status_lower:
             return self.COLOR_GREEN
-        elif self.mission_state in ['MISSION_ABORT']:
+        elif 'abort' in status_lower or 'error' in status_lower:
             return self.COLOR_RED
-        elif self.mission_state in ['READY']:
+        elif 'ready' in status_lower:
             return self.COLOR_YELLOW
-        elif self.mission_state in ['MISSION_ACTIVE', 'UGV_TO_TAKEOFF', 'DRONE_TAKEOFF', 'DRONE_APPROACH', 'DRONE_HOVER']:
+        elif 'active' in status_lower or 'moving' in status_lower or 'takeoff' in status_lower:
             return self.COLOR_BLUE
         else:
             return self.COLOR_CYAN
@@ -263,32 +258,31 @@ class UAVDashboard(Node):
         """노드 건강 상태를 체크하여 스마트한 GO/NO-GO 판단"""
         now = self.get_current_time_sec()
         
-        # 각 노드의 활성화 상태 체크 (최근 5초 내 토픽 수신 여부)
-        node_timeout = 5.0
+        # 각 노드의 활성화 상태 체크
         for node_name in self.node_status:
             if node_name == 'mission_admin':
-                self.node_status[node_name] = (now - self.topic_last_seen['MISSION_STATUS']) < node_timeout
+                self.node_status[node_name] = (now - self.topic_last_seen['MISSION_STATUS']) < self.node_timeout
             elif node_name == 'path_follower':
-                self.node_status[node_name] = (now - self.topic_last_seen['VEHICLE_STATE']) < node_timeout
+                self.node_status[node_name] = (now - self.topic_last_seen['VEHICLE_STATE']) < self.node_timeout
             elif node_name == 'offboard_control':
-                self.node_status[node_name] = (now - self.topic_last_seen['DRONE_STATE']) < node_timeout
+                self.node_status[node_name] = (now - self.topic_last_seen['DRONE_STATE']) < self.node_timeout
 
     # --- 메인 업데이트 루프 ---
     def update_dashboard(self):
         # 1. TF 정보 업데이트
         self.update_tf_poses()
-        self.tf_status = bool(self.drone_world_pos) # 드론 TF가 수신되면 GO로 판단
+        self.tf_status = bool(self.drone_world_pos)
 
         # 2. 노드 건강 상태 체크
         self.check_node_health()
 
-        # 3. Pre-flight Check (스마트한 판단)
+        # 3. Pre-flight Check
         now = self.get_current_time_sec()
         px4_ok = (now - self.topic_last_seen['PX4_LOC_POS']) < self.check_timeout
         vehicle_odom_ok = (now - self.topic_last_seen['VEHICLE_ODOM']) < self.check_timeout
         camera_ok = (now - self.topic_last_seen['CAMERA_IMG']) < self.check_timeout
         
-        # 미션 컨트롤 시스템 전체 상태 (노드들이 모두 살아있어야 함)
+        # 미션 컨트롤 시스템 전체 상태
         mission_control_ok = all(self.node_status.values())
         
         # 전체 시스템 준비 상태
@@ -296,7 +290,7 @@ class UAVDashboard(Node):
         software_ready = mission_control_ok
         all_systems_go = hardware_ready and software_ready
 
-        # 3. 화면 클리어 및 대시보드 그리기
+        # 4. 화면 클리어 및 대시보드 그리기
         os.system('clear')
         
         # === 섹션 1 & 2: 시스템 상태와 미션 상태를 좌우로 나란히 표시 ===
@@ -304,7 +298,7 @@ class UAVDashboard(Node):
         
         # 헤더 라인
         status_header = "SYSTEMS STATUS"
-        mission_header = "MISSION TIMING & STATUS"
+        mission_header = "MISSION STATUS"
         print(f"{self.COLOR_BOLD}{status_header:^35}{mission_header:^35}{self.COLOR_END}")
         print(f"{self.COLOR_BOLD}{'-'*35}{'-'*35}{self.COLOR_END}")
         
@@ -314,7 +308,7 @@ class UAVDashboard(Node):
         all_go_str = f"({hw_status}|{sw_status})"
         
         mission_color = self.get_mission_status_color()
-        mission_summary = f"{mission_color}{self.mission_state}{self.COLOR_END}"
+        mission_summary = f"{mission_color}{self.mission_status_raw}{self.COLOR_END}"
         
         print(f"{all_go_str:^40}{mission_summary:^40}")
         print()
@@ -339,57 +333,23 @@ class UAVDashboard(Node):
             status_str = f"[{self.COLOR_GREEN}GO{self.COLOR_END}]" if status else f"[{self.COLOR_RED}NO-GO{self.COLOR_END}]"
             system_lines.append(f"  {display_name}: {status_str}")
         
-        # 미션 타이밍 및 상태 정보 (오른쪽)
-        mission_stages = {
-            'UGV_TO_TAKEOFF': self.mission_state in ['UGV_TO_TAKEOFF', 'DRONE_ARMING', 'DRONE_TAKEOFF', 'MISSION_ACTIVE', 'DRONE_APPROACH', 'DRONE_HOVER', 'MISSION_COMPLETE'],
-            'DRONE_ARMING': self.mission_state in ['DRONE_ARMING', 'DRONE_TAKEOFF', 'MISSION_ACTIVE', 'DRONE_APPROACH', 'DRONE_HOVER', 'MISSION_COMPLETE'],
-            'DRONE_TAKEOFF': self.mission_state in ['DRONE_TAKEOFF', 'MISSION_ACTIVE', 'DRONE_APPROACH', 'DRONE_HOVER', 'MISSION_COMPLETE'],
-            'MISSION_ACTIVE': self.mission_state in ['MISSION_ACTIVE', 'DRONE_APPROACH', 'DRONE_HOVER', 'MISSION_COMPLETE'],
-            'DRONE_APPROACH': self.mission_state in ['DRONE_APPROACH', 'DRONE_HOVER', 'MISSION_COMPLETE'],
-            'MISSION_COMPLETE': self.mission_state == 'MISSION_COMPLETE'
-        }
-        
-        # 미션 타이밍과 체크리스트를 통합
+        # 미션 정보 (오른쪽) - 단순히 받은 정보만 표시
         mission_lines = []
         
-        # 총 경과시간과 현재 상태
+        # 총 경과시간
         if self.mission_elapsed_time > 0:
-            mission_lines.append(f"  총 시간: {self.COLOR_CYAN}{self.mission_elapsed_time:.1f}초{self.COLOR_END}")
+            mission_lines.append(f"  경과시간: {self.COLOR_CYAN}{self.mission_elapsed_time:.1f}초{self.COLOR_END}")
         else:
-            mission_lines.append(f"  총 시간: {self.COLOR_YELLOW}대기중{self.COLOR_END}")
+            mission_lines.append(f"  경과시간: {self.COLOR_YELLOW}대기중{self.COLOR_END}")
         
-        # UGV와 UAV 개별 상태
+        # 플랫폼 개별 상태
         mission_lines.append(f"  UGV: {self.COLOR_CYAN}{self.vehicle_state}{self.COLOR_END}")
         mission_lines.append(f"  UAV: {self.COLOR_CYAN}{self.drone_state}{self.COLOR_END}")
         mission_lines.append("")  # 빈 줄
         
-        # 미션 체크리스트 (간단 버전)
-        checklist_items = [
-            ("UGV이동", "UGV_TO_TAKEOFF", mission_stages['UGV_TO_TAKEOFF']),
-            ("드론ARM", "DRONE_ARMING", mission_stages['DRONE_ARMING']),
-            ("드론이륙", "DRONE_TAKEOFF", mission_stages['DRONE_TAKEOFF']),
-            ("협력미션", "MISSION_ACTIVE", mission_stages['MISSION_ACTIVE'])
-        ]
-        
-        for item_name, stage_key, is_complete in checklist_items:
-            if is_complete:
-                status_str = f"[{self.COLOR_GREEN}GO{self.COLOR_END}]"
-                # 완료된 미션의 소요시간 표시
-                if self.mission_timings[stage_key]['duration'] is not None:
-                    duration = self.mission_timings[stage_key]['duration']
-                    time_str = f"({duration:.1f}s)"
-                else:
-                    time_str = ""
-            else:
-                status_str = f"[{self.COLOR_RED}NO-GO{self.COLOR_END}]"
-                # 현재 진행 중인 미션의 경과시간 표시
-                if stage_key == self.mission_state and self.mission_timings[stage_key]['start_time'] is not None:
-                    current_duration = self.get_current_time_sec() - self.mission_timings[stage_key]['start_time']
-                    time_str = f"({current_duration:.1f}s)"
-                else:
-                    time_str = ""
-            
-            mission_lines.append(f"  {item_name}: {status_str}{time_str}")
+        # 미션 상태 상세 정보
+        mission_lines.append(f"  현재 단계:")
+        mission_lines.append(f"    {mission_color}{self.mission_status_raw}{self.COLOR_END}")
         
         # 빈 줄로 패딩하여 같은 높이로 맞춤
         max_lines = max(len(system_lines), len(mission_lines))
@@ -401,7 +361,6 @@ class UAVDashboard(Node):
         # 좌우로 나란히 출력
         for sys_line, mission_line in zip(system_lines, mission_lines):
             # ANSI 코드를 제외한 실제 텍스트 길이 계산
-            import re
             sys_clean = re.sub(r'\033\[[0-9;]*m', '', sys_line)
             mission_clean = re.sub(r'\033\[[0-9;]*m', '', mission_line)
             
@@ -435,7 +394,7 @@ class UAVDashboard(Node):
         print(f"\n{self.COLOR_BOLD}{'-'*70}\n{'PLATFORM TELEMETRY':^70}\n{'-'*70}{self.COLOR_END}")
         
         # --- 드론 정보 ---
-        print(f"  {self.COLOR_BOLD}DRONE (x500_gimbal_0){self.COLOR_END}")
+        print(f"  {self.COLOR_BOLD}DRONE ({self.drone_frame_id}){self.COLOR_END}")
         print(self.format_data("STATE", self.drone_state))
         if self.drone_world_pos:
             w_pos = self.drone_world_pos
@@ -461,7 +420,7 @@ class UAVDashboard(Node):
             print(self.format_data("GPS (Lat/Lon/Alt)", "Waiting for PX4..."))
 
         # --- 차량 정보 ---
-        print(f"\n  {self.COLOR_BOLD}VEHICLE (X1_asp){self.COLOR_END}")
+        print(f"\n  {self.COLOR_BOLD}VEHICLE ({self.vehicle_frame_id}){self.COLOR_END}")
         print(self.format_data("STATE", self.vehicle_state))
         if self.vehicle_world_pos:
             vw_pos = self.vehicle_world_pos

@@ -20,10 +20,10 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'offboard_control = uav_controller.offboard_control_mission:main',
+            'interactive_mission = uav_controller.interactive_mission:main',
+            'waypoint_mission = uav_controller.waypoint_mission:main',
             'offboard_control_abscoord_test = uav_controller.offboard_control_abscoord_test:main',
             'offboard_control_mission_traverse = uav_controller.offboard_control_abscoord_traversal:main',
-            'offboard_control_mission_flythrough = uav_controller.offboard_control_abscoord_flythrough:main',
         ],
     },
 )
