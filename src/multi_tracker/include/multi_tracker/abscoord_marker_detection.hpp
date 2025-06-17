@@ -5,9 +5,8 @@
 #include "rclcpp/rclcpp.hpp"
 #include "sensor_msgs/msg/image.hpp"
 #include "sensor_msgs/msg/camera_info.hpp"
-#include "std_msgs/msg/int32.hpp"
 
-// vision_msgs 관련 헤더 추가
+// vision_msgs
 #include "vision_msgs/msg/detection3_d_array.hpp"
 #include "vision_msgs/msg/detection3_d.hpp"
 #include "vision_msgs/msg/object_hypothesis_with_pose.hpp"
@@ -18,6 +17,8 @@
 
 #include "tf2_ros/buffer.h"
 #include "tf2_ros/transform_listener.h"
+#include <tf2/LinearMath/Transform.h>
+#include <map>
 
 
 class MultiTrackerNode : public rclcpp::Node
@@ -25,44 +26,48 @@ class MultiTrackerNode : public rclcpp::Node
 public:
     MultiTrackerNode();
 
+    // Public accessors for stored marker coordinates
+    const std::map<int, tf2::Transform>& getMarkerFromOpticalTransforms() const { return _T_marker_from_optical_map; }
+    const std::map<int, tf2::Transform>& getOpticalFromMarkerTransforms() const { return _T_optical_from_marker_map; }
+    const std::map<int, tf2::Transform>& getMapFromMarkerTransforms() const { return _T_map_from_marker_map; }
+
 private:
     void loadParameters();
     void image_callback(const sensor_msgs::msg::Image::SharedPtr msg);
     void camera_info_callback(const sensor_msgs::msg::CameraInfo::SharedPtr msg);
-    void annotate_image(cv_bridge::CvImagePtr image, bool detected);
 
     rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr _image_sub;
     rclcpp::Subscription<sensor_msgs::msg::CameraInfo>::SharedPtr _camera_info_sub;
     
-    // 이전 Publisher들
-    rclcpp::Publisher<std_msgs::msg::Int32>::SharedPtr _target_id_pub;
     rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr _image_pub;
-    
-    // 새로운 Detection3DArray Publisher
     rclcpp::Publisher<vision_msgs::msg::Detection3DArray>::SharedPtr _marker_detections_pub;
 
-    // TF 리스너 및 버퍼
+    // TF
     std::unique_ptr<tf2_ros::Buffer> _tf_buffer;
     std::shared_ptr<tf2_ros::TransformListener> _tf_listener{nullptr};
+    tf2::Transform _T_physical_from_optical;
 
+    // Marker position storage
+    std::map<int, tf2::Transform> _T_optical_from_marker_map;  // 마커 기준 드론(카메라) 위치
+    std::map<int, tf2::Transform> _T_marker_from_optical_map;  // 드론(카메라) 기준 마커 위치
+    std::map<int, tf2::Transform> _T_map_from_marker_map;      // 맵 기준 마커 위치
+
+    // OpenCV / Aruco
     cv::Mat _camera_matrix;
     cv::Mat _dist_coeffs;
     cv::Ptr<cv::aruco::Dictionary> _dictionary;
     cv::Ptr<cv::aruco::DetectorParameters> _detectorParams;
 
-    // 파라미터 변수
+    // Parameters
     std::string _camera_frame_id;
     int _param_dictionary;
     double _param_marker_size;
 
-    std::string _optical_frame_id;
     std::string _image_topic;
     std::string _camera_info_topic;
-    std::string _target_id_topic;
     std::string _image_proc_topic;
     std::string _marker_detections_topic;
-
-    double _target[3] = {0.0, 0.0, 0.0};
+    std::string _drone_frame_id;
 };
 
 #endif // MULTI_TRACKER_NODE_HPP_

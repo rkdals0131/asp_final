@@ -15,12 +15,6 @@ find_package(tf2_geometry_msgs REQUIRED)
 find_package(visualization_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 
-add_executable(path_follower_node src/path_follower_node.cpp)
-ament_target_dependencies(path_follower_node rclcpp sensor_msgs geometry_msgs tf2 tf2_geometry_msgs visualization_msgs nav_msgs)
-
-install(TARGETS path_follower_node
-  DESTINATION lib/${PROJECT_NAME})
-
 install(DIRECTORY launch
   DESTINATION share/${PROJECT_NAME}
 )
@@ -31,7 +25,6 @@ ament_python_install_package(${PROJECT_NAME})
 # Install Python executables
 install(PROGRAMS
   src/path_follower_node.py
-  src/teleop_keyboard_node.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

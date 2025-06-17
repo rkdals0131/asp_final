@@ -126,7 +126,7 @@ class UAVDashboard(Node):
         # --- Subscriber 초기화 ---
         self.create_subscription(VehicleLocalPosition, "/fmu/out/vehicle_local_position", self.drone_local_pos_callback, qos_best_effort)
         self.create_subscription(Odometry, "/model/X1/odometry", self.vehicle_odometry_callback, qos_reliable)
-        self.create_subscription(Image, "/image_proc", self.camera_image_callback, qos_best_effort)
+        self.create_subscription(Image, "/x500/image_proc", self.camera_image_callback, qos_best_effort)
         self.create_subscription(Detection3DArray, "/marker_detections", self.marker_detection_callback, qos_reliable)
         self.create_subscription(String, "/drone/state", self.drone_state_callback, qos_reliable)
         self.create_subscription(String, "/vehicle/state", self.vehicle_state_callback, qos_reliable)
