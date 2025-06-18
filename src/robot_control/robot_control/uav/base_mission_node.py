@@ -22,7 +22,7 @@ from tf2_ros.buffer import Buffer
 from tf2_ros.transform_listener import TransformListener
 
 # 로컬 유틸리티 모듈
-from . import drone_control_utils as dcu
+from ..utils import drone_control_utils as dcu
 
 
 class BaseMissionNode(Node, ABC):
@@ -125,7 +125,9 @@ class BaseMissionNode(Node, ABC):
             bool: TF 조회 성공 여부
         """
         try:
-            trans = self.tf_buffer.lookup_transform('map', self.drone_frame_id, rclpy.time.Time())
+            # TF lookup용 완전한 프레임 ID 구성 (base_link 접미사 추가)
+            full_drone_frame_id = f"{self.drone_frame_id}/base_link"
+            trans = self.tf_buffer.lookup_transform('map', full_drone_frame_id, rclpy.time.Time())
             
             if self.current_map_pose is None:
                 self.current_map_pose = PoseStamped()
@@ -140,7 +142,7 @@ class BaseMissionNode(Node, ABC):
         except TransformException as e:
             if self.state != "INIT":
                 self.get_logger().warn(
-                    f"TF lookup failed for '{self.drone_frame_id}': {e}", 
+                    f"TF lookup failed for '{full_drone_frame_id}': {e}", 
                     throttle_duration_sec=1.0
                 )
             return False

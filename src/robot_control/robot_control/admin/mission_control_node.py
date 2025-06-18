@@ -33,15 +33,15 @@ class SimpleMissionControl(Node):
     """
 
     def __init__(self):
-        super().__init__('simple_mission_control')
+        super().__init__('mission_control_node')
         self.set_parameters([Parameter('use_sim_time', value=True)])
 
         # === 파라미터 선언 ===
         self.declare_parameter('check_timeout', 2.0,
             ParameterDescriptor(description="토픽 수신 타임아웃 (초)"))
-        self.declare_parameter('drone_frame_id', 'x500_gimbal_0/base_link',
+        self.declare_parameter('drone_frame_id', 'x500_gimbal_0',
             ParameterDescriptor(description="드론 TF 프레임 ID"))
-        self.declare_parameter('vehicle_frame_id', 'X1_asp/base_link',
+        self.declare_parameter('vehicle_frame_id', 'X1_asp',
             ParameterDescriptor(description="차량 TF 프레임 ID"))
         self.declare_parameter('map_frame', 'map',
             ParameterDescriptor(description="맵 TF 프레임 ID"))
@@ -257,12 +257,22 @@ class SimpleMissionControl(Node):
         self.mission_status_pub.publish(status_msg)
 
     def update_tf_poses(self):
-        """TF Listener를 사용하여 시스템 상태 확인"""
+        """TF 정보 업데이트 (간단한 상태 체크용)"""
         try:
-            trans_drone = self.tf_buffer.lookup_transform(self.map_frame, self.drone_frame_id, rclpy.time.Time())
-            self.tf_status = True
+            # TF lookup용 완전한 프레임 ID 구성 (base_link 접미사 추가)
+            full_drone_frame_id = f"{self.drone_frame_id}/base_link"
+            trans_drone = self.tf_buffer.lookup_transform(self.map_frame, full_drone_frame_id, rclpy.time.Time())
+            # 필요시 추가 정보 저장
         except TransformException:
-            self.tf_status = False
+            pass
+
+        try:
+            # UGV도 동일하게 base_link 접미사 추가
+            full_vehicle_frame_id = f"{self.vehicle_frame_id}/base_link"
+            trans_vehicle = self.tf_buffer.lookup_transform(self.map_frame, full_vehicle_frame_id, rclpy.time.Time())
+            # 필요시 추가 정보 저장
+        except TransformException:
+            pass
 
     def update_data(self):
         """데이터 업데이트 및 미션 상태 확인 - ROS 시간 기반"""

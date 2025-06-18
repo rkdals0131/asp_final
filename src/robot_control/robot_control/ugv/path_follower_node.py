@@ -28,7 +28,7 @@ class PathFollowerNode(Node):
     - 경로 완료 시 미션 컨트롤에 신호 전송 (경로의 의미는 해석하지 않음)
     """
     def __init__(self):
-        super().__init__('path_follower_advanced')
+        super().__init__('path_follower_node')
 
         # === 핵심 파라미터 ===
         self.declare_parameter('max_jerk_with_drone', 1.0,
@@ -50,13 +50,25 @@ class PathFollowerNode(Node):
         self.declare_parameter('waypoint_reach_threshold', 1.5, ParameterDescriptor(description="웨이포인트 도착 판단 반경 (m)"))
         self.declare_parameter('path_density', 0.1, ParameterDescriptor(description="경로점 생성 간격 (m)"))
         self.declare_parameter('map_frame', 'map', ParameterDescriptor(description="맵 TF 프레임"))
-        self.declare_parameter('vehicle_base_frame', 'X1_asp/base_link', ParameterDescriptor(description="차량 기준 TF 프레임"))
+        self.declare_parameter('vehicle_base_frame', 'X1_asp', ParameterDescriptor(description="차량 기준 TF 프레임"))
         
         # === 경로 로딩 파라미터 ===
         self.declare_parameter('waypoint_file', '', 
             ParameterDescriptor(description="웨이포인트 파일 경로 (YAML/CSV). 비어있으면 기본 경로 사용"))
         self.declare_parameter('use_mission_ids', True, 
             ParameterDescriptor(description="미션 ID 기반 완료 신호 전송 여부"))
+        
+        # === ROS2 파라미터 기반 웨이포인트 ===
+        self.declare_parameter('waypoints', [0.0], 
+            ParameterDescriptor(description="웨이포인트 좌표 평면 배열 [x1, y1, x2, y2, ...]"))
+        self.declare_parameter('mission_types', [1], 
+            ParameterDescriptor(description="미션 타입 목록 [1, 2, 3, 4, ...]"))
+        self.declare_parameter('target_speeds', [-1.0], 
+            ParameterDescriptor(description="목표 속도 목록 [-1.0, 0.0, 1.5, ...]"))
+        self.declare_parameter('waypoint_names', ["default"], 
+            ParameterDescriptor(description="웨이포인트 이름 목록 (선택사항)"))
+        self.declare_parameter('default_speed', 3.0, 
+            ParameterDescriptor(description="기본 목표 속도 (m/s)"))
 
         # 파라미터 로딩
         self.MAX_JERK_WITH_DRONE = self.get_parameter('max_jerk_with_drone').value
@@ -199,15 +211,17 @@ class PathFollowerNode(Node):
 
     def _update_vehicle_pose(self):
         try:
+            # TF lookup용 완전한 프레임 ID 구성 (base_link 접미사 추가)
+            full_vehicle_frame_id = f"{self.VEHICLE_BASE_FRAME}/base_link"
             trans = self.tf_buffer.lookup_transform(
-                self.MAP_FRAME, self.VEHICLE_BASE_FRAME, rclpy.time.Time())
+                self.MAP_FRAME, full_vehicle_frame_id, rclpy.time.Time())
             pos = trans.transform.translation
             quat = trans.transform.rotation
             _, _, yaw = self._quat_to_euler(quat)
             self.vehicle_pose_map = (pos.x, pos.y, yaw)
             return True
         except TransformException as ex:
-            self.get_logger().warn(f'Could not transform {self.VEHICLE_BASE_FRAME} to {self.MAP_FRAME}: {ex}', throttle_duration_sec=1.0)
+            self.get_logger().warn(f'Could not transform {full_vehicle_frame_id} to {self.MAP_FRAME}: {ex}', throttle_duration_sec=1.0)
             return False
 
     def control_loop(self):
@@ -622,8 +636,50 @@ class PathFollowerNode(Node):
         self.lookahead_marker_pub.publish(marker)
 
     def _load_waypoints(self):
-        """웨이포인트 로드 - 파일 또는 기본값"""
-        # 파일에서 로드 시도
+        """웨이포인트 로드 - ROS2 파라미터 또는 파일 또는 기본값"""
+        
+        # 1. 먼저 ROS2 파라미터에서 웨이포인트 로드 시도
+        try:
+            waypoints_coords = self.get_parameter('waypoints').value
+            mission_types = self.get_parameter('mission_types').value
+            target_speeds = self.get_parameter('target_speeds').value
+            
+            if len(waypoints_coords) > 1 and len(waypoints_coords) % 2 == 0:
+                num_waypoints = len(waypoints_coords) // 2
+                
+                # 기본값 설정
+                if len(mission_types) == 0:
+                    mission_types = [1] * num_waypoints
+                if len(target_speeds) == 0:
+                    target_speeds = [-1.0] * num_waypoints
+                    
+                # 웨이포인트 변환 (평면 배열 -> 튜플 형식)
+                waypoints = []
+                for i in range(num_waypoints):
+                    x = float(waypoints_coords[i * 2])
+                    y = float(waypoints_coords[i * 2 + 1])
+                    mission_type = mission_types[i] if i < len(mission_types) else 1
+                    target_speed = target_speeds[i] if i < len(target_speeds) else -1.0
+                    waypoints.append((x, y, mission_type, target_speed))
+                
+                # 웨이포인트 이름 로드 (선택사항)
+                try:
+                    waypoint_names = self.get_parameter('waypoint_names').value
+                    if len(waypoint_names) != num_waypoints:
+                        waypoint_names = [f"wp_{i}" for i in range(num_waypoints)]
+                except:
+                    waypoint_names = [f"wp_{i}" for i in range(num_waypoints)]
+                
+                self.get_logger().info(f"✅ ROS2 파라미터에서 웨이포인트 로드 성공: {num_waypoints}개")
+                self.get_logger().info(f"   - 좌표 수: {len(waypoints_coords)} ({num_waypoints} waypoints)")
+                self.get_logger().info(f"   - 미션 타입: {mission_types}")
+                self.get_logger().info(f"   - 목표 속도: {target_speeds}")
+                return waypoints
+                
+        except Exception as e:
+            self.get_logger().info(f"ROS2 파라미터에서 웨이포인트 로드 실패: {e}")
+        
+        # 2. 파일에서 로드 시도
         if self.waypoint_file:
             try:
                 waypoints = self._load_waypoints_from_file(self.waypoint_file)
@@ -636,7 +692,8 @@ class PathFollowerNode(Node):
                 self.get_logger().error(f"❌ 웨이포인트 파일 로드 실패: {e}")
                 self.get_logger().info("기본 웨이포인트 사용")
         
-        # 기본 웨이포인트 반환
+        # 3. 기본 웨이포인트 반환
+        self.get_logger().info("🔄 기본 웨이포인트 사용")
         return [
             (-130.04, 51.88, 1, -1.0),
             (-132.71, 58.04, 1, -1.0),

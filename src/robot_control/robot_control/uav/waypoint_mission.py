@@ -13,8 +13,8 @@ from std_msgs.msg import String
 from mission_admin_interfaces.srv import MissionComplete
 
 from .base_mission_node import BaseMissionNode
-from . import drone_control_utils as dcu
-from . import visualization_utils as visu
+from ..utils import drone_control_utils as dcu
+from ..utils import visualization_utils as visu
 
 
 class WaypointMissionNode(BaseMissionNode):
@@ -53,7 +53,10 @@ class WaypointMissionNode(BaseMissionNode):
         # --- 웨이포인트 미션 관련 변수 ---
         self.current_waypoint_index = 0
         self.hover_start_time = None
-        self.gimbal_camera_frame_id = "x500_gimbal_0/camera_link"
+        
+        # 짐벌 카메라 프레임 ID 파라미터로 로드 (config에서 받아옴)
+        self.declare_parameter('gimbal_camera_frame', 'x500_gimbal_0/camera_link')
+        self.gimbal_camera_frame_id = self.get_parameter('gimbal_camera_frame').value
         
         # --- 커맨드 입력 스레드 (간단한 제어용) ---
         self.input_thread = threading.Thread(target=self.command_input_loop)

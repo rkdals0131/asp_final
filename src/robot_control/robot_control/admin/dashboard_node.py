@@ -31,7 +31,7 @@ class UAVDashboard(Node):
     """
 
     def __init__(self):
-        super().__init__('uav_dashboard_node')
+        super().__init__('dashboard_node')
         self.set_parameters([Parameter('use_sim_time', value=True)])
 
         # === 파라미터 선언 ===
@@ -50,9 +50,9 @@ class UAVDashboard(Node):
         self.declare_parameter('mission_status_topic', '/mission/status',
             ParameterDescriptor(description="미션 상태 토픽"))
         
-        self.declare_parameter('drone_frame_id', 'x500_gimbal_0/base_link',
+        self.declare_parameter('drone_frame_id', 'x500_gimbal_0',
             ParameterDescriptor(description="드론 TF 프레임 ID"))
-        self.declare_parameter('vehicle_frame_id', 'X1_asp/base_link',
+        self.declare_parameter('vehicle_frame_id', 'X1_asp',
             ParameterDescriptor(description="차량 TF 프레임 ID"))
         self.declare_parameter('map_frame', 'map',
             ParameterDescriptor(description="맵 TF 프레임 ID"))
@@ -201,13 +201,17 @@ class UAVDashboard(Node):
     def update_tf_poses(self):
         """TF Listener를 사용하여 드론과 차량의 월드 좌표를 업데이트합니다."""
         try:
-            trans_drone = self.tf_buffer.lookup_transform(self.map_frame, self.drone_frame_id, rclpy.time.Time())
+            # TF lookup용 완전한 프레임 ID 구성 (base_link 접미사 추가)
+            full_drone_frame_id = f"{self.drone_frame_id}/base_link"
+            trans_drone = self.tf_buffer.lookup_transform(self.map_frame, full_drone_frame_id, rclpy.time.Time())
             self.drone_world_pos = trans_drone.transform.translation
         except TransformException:
             self.drone_world_pos = None
 
         try:
-            trans_vehicle = self.tf_buffer.lookup_transform(self.map_frame, self.vehicle_frame_id, rclpy.time.Time())
+            # UGV도 동일하게 base_link 접미사 추가
+            full_vehicle_frame_id = f"{self.vehicle_frame_id}/base_link"
+            trans_vehicle = self.tf_buffer.lookup_transform(self.map_frame, full_vehicle_frame_id, rclpy.time.Time())
             self.vehicle_world_pos = trans_vehicle.transform.translation
         except TransformException:
             self.vehicle_world_pos = None

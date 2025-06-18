@@ -14,8 +14,8 @@ from px4_msgs.msg import VehicleLandDetected, GimbalDeviceAttitudeStatus, Vehicl
 from geometry_msgs.msg import PoseStamped
 
 from .base_mission_node import BaseMissionNode
-from . import drone_control_utils as dcu
-from . import visualization_utils as visu
+from ..utils import drone_control_utils as dcu
+from ..utils import visualization_utils as visu
 
 
 class InteractiveMissionNode(BaseMissionNode):
@@ -25,7 +25,7 @@ class InteractiveMissionNode(BaseMissionNode):
     """
     
     def __init__(self):
-        super().__init__('interactive_mission_node', drone_frame_id="x500_gimbal_0/base_link")
+        super().__init__('interactive_mission_node', drone_frame_id="x500_gimbal_0")
         
         # --- 추가 서브스크라이버 (대화형 미션 전용) ---
         self.land_detected_subscriber = self.create_subscription(
