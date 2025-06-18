@@ -56,7 +56,7 @@ class InteractiveMissionNode(BaseMissionNode):
         self.input_thread.start()
         
         self.get_logger().info("🎮 대화형 미션 컨트롤러가 실행 중입니다.")
-        self.get_logger().info(f"📍 드론 웨이포인트: {len(self.drone_waypoints)}개, 스타르 타겟: {len(self.stare_targets)}개")
+        self.get_logger().info(f"📍 드론 웨이포인트: {len(self.drone_waypoints)}개, 주시 타겟: {len(self.stare_targets)}개")
         self.get_logger().info("TF 및 Local Position 데이터를 기다리는 중...")
         self.get_logger().info("💡 'start' 또는 'arm' 명령으로 드론을 시동하세요.")
     
@@ -92,8 +92,8 @@ class InteractiveMissionNode(BaseMissionNode):
         print("    arm                      - (착륙 후) 재시동")
         print("    stop                     - (비행 중) 현재 위치에 정지")
         print("  [이동 제어]")
-        print("    go <0-5|final>           - 스타르 타겟으로 이동 (고도 변경 포함)")
-        print("    strafe <0-5|final>       - 스타르 타겟으로 수평 이동 (현재 고도 유지)")
+        print("    go <0-5|final>           - 주시 타겟으로 이동 (고도 변경 포함)")
+        print("    strafe <0-5|final>       - 주시 타겟으로 수평 이동 (현재 고도 유지)")
         print("    go_wp <0-6>              - 드론 웨이포인트로 이동")
         print("    strafe_wp <0-6>          - 드론 웨이포인트로 수평 이동 (현재 고도 유지)")
         print("    climb <meters>           - 지정한 미터만큼 상대 고도 상승")
@@ -102,11 +102,12 @@ class InteractiveMissionNode(BaseMissionNode):
         print("    moveto <x> <y> <z>       - 지정한 절대좌표(map frame)로 이동")
         print("    head <degrees>           - 현재 위치에서 지정한 각도 방향으로 회전 (0=동쪽, 90=북쪽, 180=서쪽, 270=남쪽)")
         print("  [짐벌 제어]")
-        print("    look <0-6>               - 지정 번호의 스타르 타겟을 한번 바라봄")
+        print("    look <0-6>               - 지정 번호의 주시 타겟을 한번 바라봄")
         print("    look forward             - 짐벌 정면으로 초기화")
         print("    look down                - 짐벌 수직 아래로")
-        print("    stare <0-6>              - 지정 번호의 스타르 타겟을 계속 추적/응시")
+        print("    stare <0-6>              - 지정 번호의 주시 타겟을 계속 추적/응시")
         print("    stare stop               - 추적/응시 중지")
+        print("    gimbal set <pitch> <yaw> [roll] - 짐벌을 지정 각도로 설정")
         print("-----------------------------")
 
         # 명령어-핸들러 매핑
@@ -145,6 +146,8 @@ class InteractiveMissionNode(BaseMissionNode):
                 self._handle_look_command(cmd[1])
             elif command == "stare" and len(cmd) > 1:
                 self._handle_stare_command(cmd[1])
+            elif command == "gimbal" and len(cmd) > 1:
+                self._handle_gimbal_command(cmd[1:])
             else:
                 self.get_logger().warn(f"알 수 없는 명령: '{line.strip()}'")
     
@@ -196,7 +199,7 @@ class InteractiveMissionNode(BaseMissionNode):
             if target_str == "final":
                 if use_stare_targets:
                     wp = self.final_destination
-                    target_yaw = None  # 스타르 타겟으로 이동 시에는 yaw 제어 안함
+                    target_yaw = None  # 주시 타겟으로 이동 시에는 yaw 제어 안함
                     self.get_logger().info(f"사용자 명령: {command.upper()} to final destination (stare target).")
                 else:
                     # 드론 웨이포인트에서는 마지막 웨이포인트 사용
@@ -208,11 +211,11 @@ class InteractiveMissionNode(BaseMissionNode):
                 wp_index = int(target_str)
                 if use_stare_targets:
                     if wp_index >= len(self.stare_targets):
-                        self.get_logger().error(f"스타르 타겟 인덱스 {wp_index}가 범위를 벗어났습니다. (0-{len(self.stare_targets)-1})")
+                        self.get_logger().error(f"주시 타겟 인덱스 {wp_index}가 범위를 벗어났습니다. (0-{len(self.stare_targets)-1})")
                         return
                     wp = self.stare_targets[wp_index]
                     self.get_logger().info(f"사용자 명령: {command.upper()} to stare target {wp_index}.")
-                    # 스타르 타겟으로 이동 시에는 yaw 제어 안함
+                    # 주시 타겟으로 이동 시에는 yaw 제어 안함
                     target_yaw = None
                 else:
                     if wp_index >= len(self.drone_waypoints):
@@ -230,7 +233,7 @@ class InteractiveMissionNode(BaseMissionNode):
             elif command == "strafe":
                 self.target_pose_map.pose.position.z = self.current_map_pose.pose.position.z
             
-            # 드론 웨이포인트의 경우 yaw 적용, 스타르 타겟의 경우 yaw 제어 해제
+            # 드론 웨이포인트의 경우 yaw 적용, 주시 타겟의 경우 yaw 제어 해제
             self.target_yaw_deg = target_yaw if not use_stare_targets else None
             self.state = "MOVING"
             
@@ -313,17 +316,7 @@ class InteractiveMissionNode(BaseMissionNode):
             # 목표 yaw 각도 저장 (임시로 target_pose_map에 저장하기 위해 새로운 속성 추가)
             self.target_yaw_deg = target_yaw_deg
             
-            # 방향 설명 생성
-            direction_map = {
-                0: "동쪽", 45: "북동쪽", 90: "북쪽", 135: "북서쪽",
-                180: "서쪽", 225: "남서쪽", 270: "남쪽", 315: "남동쪽"
-            }
-            
-            # 가장 가까운 주요 방향 찾기
-            closest_dir = min(direction_map.keys(), key=lambda x: min(abs(target_yaw_deg - x), abs(target_yaw_deg - x + 360), abs(target_yaw_deg - x - 360)))
-            direction_desc = direction_map.get(closest_dir, f"{target_yaw_deg:.0f}도 방향")
-            
-            self.get_logger().info(f"사용자 명령: HEAD {target_yaw_deg:.0f}도 ({direction_desc})")
+            self.get_logger().info(f"사용자 명령: HEAD {target_yaw_deg:.0f}도")
             self.state = "HEADING"  # 새로운 상태 추가
             
         except ValueError:
@@ -363,7 +356,7 @@ class InteractiveMissionNode(BaseMissionNode):
             try:
                 target_index = int(sub_command)
                 if 0 <= target_index < len(self.stare_targets):
-                    self.get_logger().info(f"사용자 명령: STARE {target_index}. 스타르 타겟을 계속 추적합니다.")
+                    self.get_logger().info(f"사용자 명령: STARE {target_index}. 주시 타겟을 계속 추적합니다.")
                     self.stare_target_index = target_index
                     # 즉시 한번 조준 실행
                     self.point_gimbal_at_target(self.stare_targets[self.stare_target_index])
@@ -372,10 +365,41 @@ class InteractiveMissionNode(BaseMissionNode):
             except ValueError:
                 self.get_logger().error(f"잘못된 stare 명령입니다. 'stop' 또는 인덱스 0-{len(self.stare_targets)-1}을 사용하세요")
     
+    def _handle_gimbal_command(self, args):
+        """짐벌 관련 명령을 처리합니다."""
+        if not args:
+            self.get_logger().error("짐벌 명령이 불완전합니다.")
+            return
+        
+        sub_command = args[0].lower()
+        
+        if sub_command == "set" and len(args) >= 3:
+            self._handle_gimbal_set_command(args[1:])
+        else:
+            self.get_logger().error("사용법: gimbal set <pitch> <yaw> [roll]")
+    
+    def _handle_gimbal_set_command(self, args):
+        """짐벌 각도 설정 명령을 처리합니다."""
+        try:
+            if len(args) < 2:
+                self.get_logger().error("사용법: gimbal set <pitch> <yaw> [roll]")
+                return
+            
+            pitch = float(args[0])
+            yaw = float(args[1])
+            roll = float(args[2]) if len(args) > 2 else 0.0
+            
+            self.get_logger().info(f"짐벌 각도 설정: Pitch={pitch:.0f}°, Yaw={yaw:.0f}°, Roll={roll:.0f}°")
+            dcu.set_gimbal_angle(self, pitch_deg=pitch, yaw_deg=yaw, roll_deg=roll)
+            
+        except ValueError:
+            self.get_logger().error("각도 값이 잘못되었습니다. 숫자를 입력하세요.")
+    
+
     # --- 시각화 ---
     
     def _publish_all_markers(self):
-        """모든 웨이포인트와 스타르 타겟 위치에 마커를 게시합니다."""
+        """모든 웨이포인트와 주시 타겟 위치에 마커를 게시합니다."""
         marker_array = visu.create_interactive_mission_markers(
             self, self.drone_waypoints.tolist(), self.stare_targets, self.final_destination
         )

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 웨이포인트 자동 순회 미션 노드
-지정된 웨이포인트를 순서대로 방문하며, 각 지점에서 스타르 타겟을 응시하고 호버링하는 자동 미션을 수행합니다.
+지정된 웨이포인트를 순서대로 방문하며, 각 지점에서 주시 타겟을 응시하고 호버링하는 자동 미션을 수행합니다.
 """
 
 import rclpy
@@ -183,7 +183,7 @@ class WaypointMissionNode(BaseMissionNode):
         # 웨이포인트로 이동 (위치 + yaw 제어)
         self.publish_waypoint_setpoint(self.current_waypoint_index)
         
-        # 스타르 타겟 응시
+        # 주시 타겟 응시
         self.point_gimbal_at_target(target_stare_pos)
 
         # 도착 확인
@@ -205,7 +205,7 @@ class WaypointMissionNode(BaseMissionNode):
         # 현재 위치 유지 (위치 + yaw 제어)
         self.publish_waypoint_setpoint(self.current_waypoint_index)
         
-        # 스타르 타겟 계속 응시
+        # 주시 타겟 계속 응시
         self.point_gimbal_at_target(target_stare_pos)
         
         # 2초 호버링 완료 확인

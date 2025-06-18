@@ -309,12 +309,12 @@ def create_mission_visual_markers(node, waypoints, stare_targets=None, current_w
 
 def create_interactive_mission_markers(node, drone_waypoints, stare_targets, final_destination=None):
     """
-    대화형 미션용 드론 웨이포인트와 스타르 타겟 마커들을 생성합니다.
+    대화형 미션용 드론 웨이포인트와 주시 타겟 마커들을 생성합니다.
     
     Args:
         node: ROS2 노드 인스턴스
         drone_waypoints: 드론 웨이포인트 리스트 [[x, y, z], ...]
-        stare_targets: 스타르 타겟 리스트 [[x, y, z], ...]
+        stare_targets: 주시 타겟 리스트 [[x, y, z], ...]
         final_destination: 최종 목적지 [x, y, z] (선택사항)
         
     Returns:
@@ -331,7 +331,7 @@ def create_interactive_mission_markers(node, drone_waypoints, stare_targets, fin
         markers = create_waypoint_visual(node, i, waypoint, "future", text_label, "drone_waypoints")
         marker_array.markers.extend(markers)
     
-    # 2. 스타르 타겟들 (다양한 색상의 타겟 형태)
+    # 2. 주시 타겟들 (다양한 색상의 타겟 형태)
     for i, target in enumerate(stare_targets):
         color = colors[i % len(colors)]
         text_label = f"Stare{i}\n({target[0]:.1f}, {target[1]:.1f}, {target[2]:.1f})"

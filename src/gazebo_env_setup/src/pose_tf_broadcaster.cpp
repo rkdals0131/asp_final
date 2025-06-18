@@ -2,6 +2,8 @@
 #include "tf2_ros/transform_broadcaster.h"
 #include "tf2_msgs/msg/tf_message.hpp"
 #include "geometry_msgs/msg/transform_stamped.hpp"
+#include "tf2/LinearMath/Quaternion.h"
+#include "tf2/LinearMath/Matrix3x3.h"
 
 #include <vector>
 #include <string>
@@ -48,7 +50,49 @@ private:
 
       // 3. TF 퍼블리시
       tf_broadcaster_->sendTransform(transform);
+
+      // 4. x500_gimbal_0/camera_link에 대해 RDF 변환된 프레임 추가 생성
+      if (transform.child_frame_id == "x500_gimbal_0/camera_link")
+      {
+        create_rdf_camera_transform(transform);
+      }
     }
+  }
+
+  void create_rdf_camera_transform(const geometry_msgs::msg::TransformStamped& original_transform)
+  {
+    geometry_msgs::msg::TransformStamped rdf_transform = original_transform;
+    
+    // 새로운 child_frame_id 설정
+    rdf_transform.child_frame_id = "x500_gimbal_0/camera_link_rdf";
+    
+    // 원래 회전을 쿼터니언으로 받아오기
+    tf2::Quaternion original_quat(
+      original_transform.transform.rotation.x,
+      original_transform.transform.rotation.y,
+      original_transform.transform.rotation.z,
+      original_transform.transform.rotation.w
+    );
+    
+    // RDF 변환 행렬을 쿼터니언으로 변환
+    // rotation_matrix_rdf = [[0, 0, -1], [1, 0, 0], [0, -1, 0]]
+    // 이는 Y축으로 90도, X축으로 -90도 회전과 동일
+    tf2::Quaternion rdf_rotation;
+    rdf_rotation.setRPY(-M_PI/2, 0, M_PI/2);  // RDF 변환
+    
+    // 원래 회전과 RDF 변환 합성
+    tf2::Quaternion final_quat = original_quat * rdf_rotation;
+    
+    // 새로운 변환에 적용
+    rdf_transform.transform.rotation.x = final_quat.x();
+    rdf_transform.transform.rotation.y = final_quat.y();
+    rdf_transform.transform.rotation.z = final_quat.z();
+    rdf_transform.transform.rotation.w = final_quat.w();
+    
+    // Translation은 그대로 유지 (원점은 동일)
+    
+    // RDF 변환된 TF 퍼블리시
+    tf_broadcaster_->sendTransform(rdf_transform);
   }
 
   std::shared_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;

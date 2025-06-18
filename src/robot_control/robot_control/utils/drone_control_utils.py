@@ -156,6 +156,12 @@ def point_gimbal_at_target(node, drone_map_pose: PoseStamped, target_enu_pos: li
         return
 
     drone_pos = drone_map_pose.pose.position
+    drone_q = drone_map_pose.pose.orientation
+
+    # 드론의 현재 yaw 계산 (map 좌표계, ENU 기준)
+    siny_cosp = 2 * (drone_q.w * drone_q.z + drone_q.x * drone_q.y)
+    cosy_cosp = 1 - 2 * (drone_q.y * drone_q.y + drone_q.z * drone_q.z)
+    drone_map_yaw_rad = math.atan2(siny_cosp, cosy_cosp)
     
     # ENU 좌표계에서 목표 지점까지의 벡터 계산
     delta_x = target_enu_pos[0] - drone_pos.x  # East
@@ -166,24 +172,26 @@ def point_gimbal_at_target(node, drone_map_pose: PoseStamped, target_enu_pos: li
     distance_2d = math.sqrt(delta_x**2 + delta_y**2)
     pitch_rad = math.atan2(delta_z, distance_2d)
     
-    # Yaw 계산 (ENU를 PX4 북쪽 기준으로 변환)
-    map_yaw_rad = math.atan2(delta_y, delta_x)  # ENU 기준
-    map_yaw_deg = math.degrees(map_yaw_rad)
-    px4_yaw_deg = 90.0 - map_yaw_deg  # PX4 북쪽 기준으로 변환
-    
+    # 목표지점의 절대 Yaw 계산 (map 좌표계 기준)
+    target_map_yaw_rad = math.atan2(delta_y, delta_x)
+
+    # 드론 yaw와 목표 yaw를 PX4 좌표계로 변환 (North=0, CW_positive)
+    drone_px4_yaw_deg = map_yaw_to_px4_yaw_degrees(math.degrees(drone_map_yaw_rad))
+    target_px4_yaw_deg = map_yaw_to_px4_yaw_degrees(math.degrees(target_map_yaw_rad))
+
+    # 드론 기준 상대 yaw 계산
+    relative_yaw_deg = target_px4_yaw_deg - drone_px4_yaw_deg
+
     # ±180도 범위로 정규화
-    if px4_yaw_deg > 180.0:
-        px4_yaw_deg -= 360.0
-    if px4_yaw_deg < -180.0:
-        px4_yaw_deg += 360.0
+    final_yaw_deg = normalize_angle_degrees(relative_yaw_deg)
 
     # 짐벌 제어 명령 전송
     publish_vehicle_command(
         node,
         VehicleCommand.VEHICLE_CMD_DO_MOUNT_CONTROL,
         param1=math.degrees(pitch_rad),  # Pitch
-        param3=px4_yaw_deg,              # Yaw
-        param7=2.0                       # MAV_MOUNT_MODE_YAW_BODY
+        param3=final_yaw_deg,            # Yaw (body frame)
+        param7=2.0                       # MAV_MOUNT_MODE_MAVLINK_TARGETING
     )
 
 
@@ -343,4 +351,32 @@ def point_gimbal_down(node):
         param1=-90.0,  # Pitch = -90도 (아래)
         param3=0.0,    # Yaw = 0
         param7=2.0     # MAV_MOUNT_MODE_YAW_BODY
-    ) 
+    )
+
+
+def set_gimbal_angle(node, pitch_deg=0.0, yaw_deg=0.0, roll_deg=0.0):
+    """
+    짐벌을 지정한 각도로 설정합니다.
+    
+    Args:
+        node: ROS2 노드 인스턴스
+        pitch_deg: Pitch 각도 (도 단위, -90~90)
+        yaw_deg: Yaw 각도 (도 단위, -180~180, body frame 기준)
+        roll_deg: Roll 각도 (도 단위, -180~180, 일반적으로 지원되지 않을 수 있음)
+    """
+    # 각도 제한 적용
+    pitch_deg = max(-90.0, min(90.0, pitch_deg))
+    yaw_deg = normalize_angle_degrees(yaw_deg)
+    roll_deg = normalize_angle_degrees(roll_deg)
+    
+    publish_vehicle_command(
+        node,
+        VehicleCommand.VEHICLE_CMD_DO_MOUNT_CONTROL,
+        param1=pitch_deg,  # Pitch
+        param2=roll_deg,   # Roll (일반적으로 지원되지 않을 수 있음)
+        param3=yaw_deg,    # Yaw (body frame)
+        param7=2.0         # MAV_MOUNT_MODE_MAVLINK_TARGETING
+    )
+
+
+ 
