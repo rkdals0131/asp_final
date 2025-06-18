@@ -1,0 +1,28 @@
+path_follower_node:
+  ros__parameters:
+    # === 미션 설정 ===
+    use_mission_ids: true
+    
+    # === 차량 동역학 파라미터 ===
+    max_jerk_with_drone: 1.0          # 드론 탑재 시 최대 저크 (m/s³)
+    max_jerk_default: 3.0             # 기본 최대 저크 (m/s³)
+    max_accel_with_drone: 0.5         # 드론 탑재 시 최대 가속도 (m/s²)
+    max_accel_default: 2.0            # 기본 최대 가속도 (m/s²)
+    max_decel: 1.0                    # 최대 감속도 (m/s²)
+    max_lateral_accel: 2.0            # 최대 횡방향 가속도 (m/s²)
+    
+    # === 속도 제한 ===
+    max_speed: 6.0                    # 최대 주행 속도 (m/s)
+    min_speed: 0.5                    # 최소 주행 속도 (m/s)
+    default_speed: 3.0                # 기본 속도 (m/s)
+    
+    # === 경로 추종 파라미터 ===
+    lookahead_k: 0.9                  # 전방주시거리 비례상수
+    lookahead_min: 0.5                # 최소 전방주시거리 (m)
+    lookahead_max: 3.0                # 최대 전방주시거리 (m)
+    waypoint_reach_threshold: 1.5     # 웨이포인트 도달 판단 반경 (m)
+    path_density: 0.1                 # 경로점 생성 간격 (m)
+    
+    # === TF 프레임 설정 ===
+    map_frame: "map"
+    vehicle_base_frame: "X1_asp"

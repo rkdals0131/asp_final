@@ -5,6 +5,7 @@ PX4 오프보드 제어, TF 관리, 상태 머신 골격 등의 공통 기능을
 """
 
 import rclpy
+import numpy as np
 from rclpy.node import Node
 from rclpy.parameter import Parameter
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
@@ -35,6 +36,7 @@ class BaseMissionNode(Node, ABC):
     - 공통 상태 변수 관리
     - 기본 상태 머신 골격
     - 공통 콜백 함수들
+    - 공통 미션 데이터 (웨이포인트, 스타르 타겟)
     
     자식 클래스는 run_mission_logic() 메서드를 구현하여 고유한 미션 로직을 정의해야 합니다.
     """
@@ -100,10 +102,58 @@ class BaseMissionNode(Node, ABC):
         self.handshake_counter = 0
         self.handshake_duration = 15
         
+        # --- 공통 미션 데이터 ---
+        self._setup_mission_data()
+        
         # --- 상태 머신 타이머 (10Hz) ---
         self.state_machine_timer = self.create_timer(0.1, self.run_state_machine_wrapper)
         
         self.get_logger().info(f"{node_name} initialized successfully.")
+    
+    def _setup_mission_data(self):
+        """공통 미션 데이터를 설정합니다."""
+        # 미션 정의: (x, y, z, yaw, stare_index)
+        # yaw는 맵 좌표계 기준 (X축이 0도, 반시계방향이 양수)
+        self.mission_definition = [
+            (-100, 80, 20, 315, 0),  #wp 0 stare 0
+            (-80, 80, 30, 315, 1),   #wp 1 stare 1
+            (-63, 75, 25, 180, 2),   #wp 2 stare 2
+            (-55, 72, 15, 180, 3),   #wp 3 stare 3
+            (-55, 72, 15, 180, 4),   #wp 3 stare 4
+            (-70, 112, 15, 160, 5),  #wp 4 stare 5
+            (-85, 100, 15, 170, 6),  #wp 5 stare 7
+            (-85, 100, 15, 170, 7),  #wp 5 stare 7
+            (-93, 96, 22, 170, 8),   #wp 6 stare 8
+            (-113, 95, 30, 20, 9),   #wp 7 stare 9
+            (-63, 100, 10, 270, 10),  #wp 8 stare 10
+        ]
+        
+        # 드론 웨이포인트 (x, y, z 좌표만 추출)
+        self.drone_waypoints = np.array([p[0:3] for p in self.mission_definition], dtype=np.float64)
+        
+        # 각 웨이포인트에서의 목표 yaw 각도 (맵 좌표계 기준)
+        self.waypoint_yaws = np.array([p[3] for p in self.mission_definition], dtype=np.float64)
+        
+        # 각 웨이포인트에서 응시할 스타르 타겟 인덱스
+        self.stare_indices = np.array([p[4] for p in self.mission_definition])
+        
+        # 스타르 타겟들 (짐벌이 바라볼 목표 좌표들)
+        self.stare_targets = [
+            [-94.4088, 68.4708, 3.8531],    #0, wp 0
+            [-75.4421, 74.9961, 23.2347],   #1 wp 1
+            [-75.0, 75.0, 20.0],             #2 wp 2
+            [-75.0, 75.0, 10.0],             #3 wp 3
+            [-65.0308, 80.1275, 8.4990],    #4 wp 3
+            [-82.7931, 113.4203, 3.8079],   #5 wp 4
+            [-97.9238, 105.2799, 8.5504],   #6 wp 5
+            [-109.0, 100.0, 12.0],           #7 wp 5
+            [-109.0, 100.0, 19.0],           #8 wp 6
+            [-109.1330, 100.3533, 23.1363], #9 wp 7
+            [-62.9630, 99.0915, 0.1349]     #10 wp 8
+        ]
+        
+        # 최종 목적지 (편의를 위한 별칭)
+        self.final_destination = self.stare_targets[-1]
     
     # --- 공통 콜백 함수들 ---
     
@@ -249,16 +299,59 @@ class BaseMissionNode(Node, ABC):
         """
         dcu.point_gimbal_at_target(self, self.current_map_pose, target_enu_pos)
     
-    def publish_position_setpoint(self, target_map_pos):
+    def publish_position_setpoint(self, target_map_pos, target_yaw_deg=None):
         """
         Map 좌표계 기준 위치 세트포인트를 퍼블리시합니다.
         
         Args:
             target_map_pos: 목표 map 좌표 [x, y, z]
+            target_yaw_deg: 목표 yaw 각도 (도 단위, 맵 좌표계 기준, None이면 yaw 제어 안함)
         """
         dcu.publish_position_setpoint(
-            self, self.current_local_pos, self.current_map_pose, target_map_pos
+            self, self.current_local_pos, self.current_map_pose, target_map_pos, target_yaw_deg
         )
+    
+    def publish_waypoint_setpoint(self, waypoint_index):
+        """
+        웨이포인트 인덱스를 기반으로 위치 및 yaw 세트포인트를 퍼블리시합니다.
+        
+        Args:
+            waypoint_index: 웨이포인트 인덱스 (0부터 시작)
+        """
+        if 0 <= waypoint_index < len(self.drone_waypoints):
+            target_pos = self.drone_waypoints[waypoint_index].tolist()
+            target_yaw = self.waypoint_yaws[waypoint_index]
+            self.publish_position_setpoint(target_pos, target_yaw)
+        else:
+            self.get_logger().error(f"잘못된 웨이포인트 인덱스: {waypoint_index}")
+    
+    def get_waypoint_position(self, waypoint_index):
+        """
+        웨이포인트의 위치를 반환합니다.
+        
+        Args:
+            waypoint_index: 웨이포인트 인덱스
+            
+        Returns:
+            list: [x, y, z] 좌표 또는 None (잘못된 인덱스)
+        """
+        if 0 <= waypoint_index < len(self.drone_waypoints):
+            return self.drone_waypoints[waypoint_index].tolist()
+        return None
+    
+    def get_waypoint_yaw(self, waypoint_index):
+        """
+        웨이포인트의 yaw 각도를 반환합니다.
+        
+        Args:
+            waypoint_index: 웨이포인트 인덱스
+            
+        Returns:
+            float: yaw 각도 (도 단위, 맵 좌표계 기준) 또는 None
+        """
+        if 0 <= waypoint_index < len(self.waypoint_yaws):
+            return float(self.waypoint_yaws[waypoint_index])
+        return None
     
     # --- 추상 메서드 ---
     

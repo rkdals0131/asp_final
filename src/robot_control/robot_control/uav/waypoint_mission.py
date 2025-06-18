@@ -5,7 +5,6 @@
 """
 
 import rclpy
-import numpy as np
 import threading
 import sys
 
@@ -34,22 +33,6 @@ class WaypointMissionNode(BaseMissionNode):
         # --- 미션 컨트롤 서비스 클라이언트 ---
         self.mission_complete_client = self.create_client(MissionComplete, '/mission_complete')
         
-        # --- 미션 정의 ---
-        mission_definition = [
-            (-100, 80, 20, 0), (-80, 80, 30, 1), (-65, 83, 25, 2),
-            (-80, 100, 20, 3), (-90, 103, 25, 4), (-105, 95, 30, 5),
-            (-63, 100, 10, 6)
-        ]
-        
-        self.drone_waypoints = np.array([p[0:3] for p in mission_definition], dtype=np.float64)
-        self.stare_indices = np.array([p[3] for p in mission_definition])
-        self.stare_targets = [
-            [-94.4088, 68.4708, 3.8531], [-75.4421, 74.9961, 23.2347],
-            [-65.0308, 80.1275, 8.4990], [-82.7931, 113.4203, 3.8079],
-            [-97.9238, 105.2799, 8.5504], [-109.1330, 100.3533, 23.1363],
-            [-62.9630, 99.0915, 0.1349]
-        ]
-        
         # --- 웨이포인트 미션 관련 변수 ---
         self.current_waypoint_index = 0
         self.hover_start_time = None
@@ -64,6 +47,7 @@ class WaypointMissionNode(BaseMissionNode):
         self.input_thread.start()
         
         self.get_logger().info("🛩️ 웨이포인트 미션 컨트롤러가 초기화되었습니다.")
+        self.get_logger().info(f"📍 총 {len(self.drone_waypoints)}개의 웨이포인트가 설정되었습니다.")
     
     # --- 미션 컨트롤 연동 ---
     
@@ -196,8 +180,8 @@ class WaypointMissionNode(BaseMissionNode):
         target_stare_idx = self.stare_indices[self.current_waypoint_index]
         target_stare_pos = self.stare_targets[target_stare_idx]
         
-        # 웨이포인트로 이동
-        self.publish_position_setpoint(target_wp.tolist())
+        # 웨이포인트로 이동 (위치 + yaw 제어)
+        self.publish_waypoint_setpoint(self.current_waypoint_index)
         
         # 스타르 타겟 응시
         self.point_gimbal_at_target(target_stare_pos)
@@ -218,8 +202,8 @@ class WaypointMissionNode(BaseMissionNode):
         target_stare_idx = self.stare_indices[self.current_waypoint_index]
         target_stare_pos = self.stare_targets[target_stare_idx]
         
-        # 현재 위치 유지
-        self.publish_position_setpoint(target_wp.tolist())
+        # 현재 위치 유지 (위치 + yaw 제어)
+        self.publish_waypoint_setpoint(self.current_waypoint_index)
         
         # 스타르 타겟 계속 응시
         self.point_gimbal_at_target(target_stare_pos)
@@ -243,11 +227,11 @@ class WaypointMissionNode(BaseMissionNode):
     def _handle_mission_complete_hover_state(self):
         """미션 완료 후 호버링 상태 처리"""
         # 마지막 웨이포인트에서 계속 호버링 (무한 호버링)
-        final_wp = self.drone_waypoints[-1]
-        final_stare_idx = self.stare_indices[-1]
+        final_wp_index = len(self.drone_waypoints) - 1
+        final_stare_idx = self.stare_indices[final_wp_index]
         final_stare_pos = self.stare_targets[final_stare_idx]
         
-        self.publish_position_setpoint(final_wp.tolist())
+        self.publish_waypoint_setpoint(final_wp_index)
         self.point_gimbal_at_target(final_stare_pos)
         
         self.get_logger().info("✈️ 미션 완료 - 마지막 웨이포인트에서 호버링 중...", throttle_duration_sec=10.0)

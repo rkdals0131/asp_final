@@ -19,7 +19,7 @@ setup(
             
         # Config 파일들 추가  
         (os.path.join('share', package_name, 'config'),
-            glob(os.path.join('config', '*.yaml'))),
+            glob(os.path.join('config', '*.yaml')) + glob(os.path.join('config', '*.csv'))),
     ],
     install_requires=['setuptools', 'numpy', 'scipy'],
     zip_safe=True,

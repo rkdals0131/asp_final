@@ -2,7 +2,6 @@
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, DurabilityPolicy
-from rcl_interfaces.msg import ParameterDescriptor
 
 from geometry_msgs.msg import Twist, Pose, PoseStamped
 from nav_msgs.msg import Path, Odometry
@@ -21,6 +20,8 @@ import sys
 import os
 import yaml
 
+from robot_control.utils.waypoint_parser import load_waypoints_from_csv, WaypointData
+
 class PathFollowerNode(Node):
     """
     S-Curve 속도 프로파일 기반 경로 추종 노드
@@ -31,44 +32,33 @@ class PathFollowerNode(Node):
         super().__init__('path_follower_node')
 
         # === 핵심 파라미터 ===
-        self.declare_parameter('max_jerk_with_drone', 1.0,
-            ParameterDescriptor(description="드론 탑재 시 최대 저크 (m/s³)"))
-        self.declare_parameter('max_jerk_default', 3.0,
-            ParameterDescriptor(description="기본(드론 미탑재) 최대 저크 (m/s³)"))
-        self.declare_parameter('max_accel_with_drone', 0.5,
-            ParameterDescriptor(description="드론 탑재 시 최대 종방향 가속도 (m/s²)"))
-        self.declare_parameter('max_accel_default', 2.0,
-            ParameterDescriptor(description="기본(드론 미탑재) 최대 종방향 가속도 (m/s²)"))
+        self.declare_parameter('max_jerk_with_drone', 1.0)
+        self.declare_parameter('max_jerk_default', 3.0)
+        self.declare_parameter('max_accel_with_drone', 0.5)
+        self.declare_parameter('max_accel_default', 2.0)
 
-        self.declare_parameter('lookahead_k', 2.0, ParameterDescriptor(description="전방주시거리 비례상수"))
-        self.declare_parameter('lookahead_min', 0.5, ParameterDescriptor(description="최소 전방주시거리 (m)"))
-        self.declare_parameter('lookahead_max', 3.0, ParameterDescriptor(description="최대 전방주시거리 (m)"))
-        self.declare_parameter('max_speed', 6.0, ParameterDescriptor(description="최대 주행 속도 (m/s)"))
-        self.declare_parameter('min_speed', 0.5, ParameterDescriptor(description="최소 주행 속도 (m/s)"))
-        self.declare_parameter('max_decel', 1.0, ParameterDescriptor(description="최대 종방향 감속도 (m/s²)"))
-        self.declare_parameter('max_lateral_accel', 2.0, ParameterDescriptor(description="최대 횡방향 가속도 (m/s²)"))
-        self.declare_parameter('waypoint_reach_threshold', 1.5, ParameterDescriptor(description="웨이포인트 도착 판단 반경 (m)"))
-        self.declare_parameter('path_density', 0.1, ParameterDescriptor(description="경로점 생성 간격 (m)"))
-        self.declare_parameter('map_frame', 'map', ParameterDescriptor(description="맵 TF 프레임"))
-        self.declare_parameter('vehicle_base_frame', 'X1_asp', ParameterDescriptor(description="차량 기준 TF 프레임"))
+        self.declare_parameter('lookahead_k', 2.0)
+        self.declare_parameter('lookahead_min', 0.5)
+        self.declare_parameter('lookahead_max', 3.0)
+        self.declare_parameter('max_speed', 6.0)
+        self.declare_parameter('min_speed', 0.5)
+        self.declare_parameter('max_decel', 1.0)
+        self.declare_parameter('max_lateral_accel', 2.0)
+        self.declare_parameter('waypoint_reach_threshold', 1.5)
+        self.declare_parameter('path_density', 0.1)
+        self.declare_parameter('map_frame', 'map')
+        self.declare_parameter('vehicle_base_frame', 'X1_asp')
         
         # === 경로 로딩 파라미터 ===
-        self.declare_parameter('waypoint_file', '', 
-            ParameterDescriptor(description="웨이포인트 파일 경로 (YAML/CSV). 비어있으면 기본 경로 사용"))
-        self.declare_parameter('use_mission_ids', True, 
-            ParameterDescriptor(description="미션 ID 기반 완료 신호 전송 여부"))
+        self.declare_parameter('waypoint_file', '')
+        self.declare_parameter('use_mission_ids', True)
         
         # === ROS2 파라미터 기반 웨이포인트 ===
-        self.declare_parameter('waypoints', [0.0], 
-            ParameterDescriptor(description="웨이포인트 좌표 평면 배열 [x1, y1, x2, y2, ...]"))
-        self.declare_parameter('mission_types', [1], 
-            ParameterDescriptor(description="미션 타입 목록 [1, 2, 3, 4, ...]"))
-        self.declare_parameter('target_speeds', [-1.0], 
-            ParameterDescriptor(description="목표 속도 목록 [-1.0, 0.0, 1.5, ...]"))
-        self.declare_parameter('waypoint_names', ["default"], 
-            ParameterDescriptor(description="웨이포인트 이름 목록 (선택사항)"))
-        self.declare_parameter('default_speed', 3.0, 
-            ParameterDescriptor(description="기본 목표 속도 (m/s)"))
+        self.declare_parameter('waypoints', [0.0])
+        self.declare_parameter('mission_types', [1])
+        self.declare_parameter('target_speeds', [-1.0])
+        self.declare_parameter('waypoint_names', ["default"])
+        self.declare_parameter('default_speed', 3.0)
 
         # 파라미터 로딩
         self.MAX_JERK_WITH_DRONE = self.get_parameter('max_jerk_with_drone').value
@@ -149,23 +139,40 @@ class PathFollowerNode(Node):
         self.get_logger().info(f"   - 웨이포인트 파일: {self.waypoint_file if self.waypoint_file else '기본 경로'}")
         self.get_logger().info(f"   - 로드된 웨이포인트: {len(self.raw_waypoints)}개")
         self.get_logger().info("   - 현재 모드: [With Drone]. 'go' 명령 대기 중")
+        self.get_logger().info("=" * 60)
+        self.get_logger().info("🚀 미션을 시작하려면 터미널에서 'go'를 입력하고 Enter를 누르세요!")
+        self.get_logger().info("=" * 60)
 
     def odom_callback(self, msg: Odometry):
         self.current_speed = msg.twist.twist.linear.x
 
     def mission_command_callback(self, msg: String):
         """미션 컨트롤 대시보드로부터 명령 수신"""
-        command = msg.data.lower()
-        if command == 'go' and self.is_waiting_for_go:
+        command = msg.data.lower().strip()
+        self.get_logger().info(f"📡 대시보드 명령 수신: '{command}'")
+        self._process_command(command)
+
+    def _process_command(self, cmd: str):
+        """키보드 및 토픽 명령 통합 처리"""
+        if not cmd:
+            return
+            
+        self.get_logger().info(f"⚙️ 명령 처리 중: '{cmd}'")
+        
+        if self.is_waiting_for_go and cmd == 'go':
             self.is_waiting_for_go = False
             self.path_update_timer.cancel()
-            self.get_logger().info("🚀 미션 컨트롤로부터 GO 명령 수신. 미션 시작!")
-        elif command == 'resume' and self.is_mission_paused:
+            self.get_logger().info("🚀 GO 명령 수신! 미션을 시작합니다.")
+        elif self.is_mission_paused and cmd == 'resume':
             self._resume_mission()
-        elif command == 'stop':
+        elif cmd == 'stop':
             self._stop_vehicle()
             self.is_mission_paused = True
-            self.get_logger().info("⛔ 미션 컨트롤로부터 STOP 명령 수신")
+            self.get_logger().info("⛔ STOP 명령 수신! 미션을 일시 중지합니다.")
+        else:
+            current_state = "WAITING_FOR_GO" if self.is_waiting_for_go else \
+                           "PAUSED" if self.is_mission_paused else "ACTIVE"
+            self.get_logger().warn(f"❌ 현재 상태({current_state})에서 유효하지 않은 명령: '{cmd}'")
 
     def publish_state(self):
         """현재 상태를 퍼블리시"""
@@ -267,79 +274,21 @@ class PathFollowerNode(Node):
         self._publish_lookahead_marker((goal_x, goal_y))
 
     def _command_input_loop(self):
-        for line in sys.stdin:
-            if not rclpy.ok():
+        """키보드 입력 처리 루프 - 런치 환경 호환성 개선"""
+        while rclpy.ok():
+            try:
+                cmd = input(">>> ").strip().lower()
+                
+                if cmd:
+                     self._process_command(cmd)
+                
+            except (KeyboardInterrupt, EOFError):
+                self.get_logger().info("🛑 키보드 입력 스레드 종료됨.")
                 break
-            cmd = line.strip().lower()
-            if self.is_waiting_for_go and cmd == 'go':
-                self.is_waiting_for_go = False
-                self.path_update_timer.cancel()
-                self.get_logger().info("🚀 Mission started! Mode: [With Drone]. Final path profile locked.")
-            elif self.is_mission_paused and cmd == 'resume':
-                self._resume_mission()
-            else:
-                self.get_logger().warn(f"Invalid command: '{cmd}' in current state.")
-
-    def update_full_path_and_velocity(self):
-        if not self.is_waiting_for_go or not self._update_vehicle_pose():
-            return
-            
-        start_x, start_y, _ = self.vehicle_pose_map
-        if not self.main_path_points:
-            self.get_logger().warn("Main path is empty, cannot generate full path.")
-            return
-
-        goal_x, goal_y = self.main_path_points[0]
-        initial_path = self._generate_straight_path((start_x, start_y), (goal_x, goal_y))
-        
-        self.full_path_points = initial_path + self.main_path_points
-        
-        # 마지막 웨이포인트의 타입에 따라 종료 속도 결정
-        final_waypoint = self.raw_waypoints[-1]
-        end_vel = 0.0 if len(final_waypoint) > 2 and final_waypoint[2] == 4 else 0.0  # 안전을 위해 항상 0으로 종료
-        
-        self.full_target_velocities = self._generate_scurve_velocity_profile(
-            self.full_path_points, start_vel=self.current_speed, end_vel=end_vel)
-        self._publish_path_visualization()
-
-    def _check_waypoint_arrival(self):
-        """웨이포인트 도달 확인 - 역할 단순화"""
-        if self.current_waypoint_idx >= len(self.raw_waypoints):
-            return
-            
-        waypoint = self.raw_waypoints[self.current_waypoint_idx]
-        wp_x, wp_y = waypoint[0], waypoint[1]
-        
-        if self.vehicle_pose_map is None:
-            return
-            
-        dist = math.hypot(self.vehicle_pose_map[0] - wp_x, self.vehicle_pose_map[1] - wp_y)
-        
-        # 특정 웨이포인트에서만 디버깅 로그 출력
-        if self.current_waypoint_idx == 2:
-            self.get_logger().info(f"🔍 Debug: WP{self.current_waypoint_idx} 거리체크 - 현재위치:({self.vehicle_pose_map[0]:.2f}, {self.vehicle_pose_map[1]:.2f}), 목표:({wp_x:.2f}, {wp_y:.2f}), 거리:{dist:.2f}m, 임계값:{self.REACH_THRESHOLD}m", throttle_duration_sec=2.0)
-        
-        if dist < self.REACH_THRESHOLD:
-            self.get_logger().info(f"✅ Waypoint {self.current_waypoint_idx} reached (distance: {dist:.2f}m).")
-            
-            # 특정 웨이포인트에서만 처리 (기존 로직 유지)
-            if len(waypoint) > 2:  # 미션 타입 정보가 있는 경우
-                mission_type = waypoint[2]
-                if mission_type == 2:  # 드론 이륙 지점
-                    self.is_mission_paused = True
-                    self.get_logger().info("🚁 Drone takeoff point reached. Vehicle paused.")
-                    self.get_logger().info(f"🔧 Debug: is_mission_paused set to {self.is_mission_paused}")
-                elif mission_type == 4:  # 최종 목적지
-                    self.is_mission_complete = True
-                    self.get_logger().info("🏁 Mission completed!")
-            
-            # 미션 완료 신호 전송 (매핑 테이블 사용)
-            if self.current_waypoint_idx in self.waypoint_mission_mapping:
-                mission_id = self.waypoint_mission_mapping[self.current_waypoint_idx]
-                self.send_mission_complete(mission_id)
-            
-            self.current_waypoint_idx += 1
-            self.last_closest_idx = self._find_closest_point_idx(self.vehicle_pose_map[0], self.vehicle_pose_map[1])
+            except Exception as e:
+                self.get_logger().warn(f"⚠️ 입력 처리 중 오류 발생: {e}")
+                import time
+                time.sleep(1) # 오류 발생 시 로그 폭주 방지
 
     def _resume_mission(self):
         self.get_logger().info("🚀 Switching to high-performance mode (Drone departed).")
@@ -737,33 +686,21 @@ class PathFollowerNode(Node):
         return waypoints
 
     def _load_waypoints_from_csv(self, file_path):
-        """CSV 파일에서 웨이포인트 로드"""
-        import csv
-        waypoints = []
-        
-        with open(file_path, 'r') as f:
-            reader = csv.reader(f)
-            # 헤더 건너뛰기 (첫 번째 행이 헤더인 경우)
-            first_row = next(reader)
-            if not first_row[0].replace('-', '').replace('.', '').isdigit():
-                pass  # 헤더였음
-            else:
-                # 첫 번째 행이 데이터였음
-                x, y = float(first_row[0]), float(first_row[1])
-                mission_type = int(first_row[2]) if len(first_row) > 2 else 1
-                target_speed = float(first_row[3]) if len(first_row) > 3 else -1.0
-                waypoints.append((x, y, mission_type, target_speed))
+        """CSV 파일에서 웨이포인트 로드 - 새로운 waypoint_parser 유틸리티 사용"""
+        try:
+            waypoint_data_list = load_waypoints_from_csv(file_path)
+            waypoints = []
             
-            # 나머지 행 처리
-            for row in reader:
-                if len(row) < 2:
-                    continue
-                x, y = float(row[0]), float(row[1])
-                mission_type = int(row[2]) if len(row) > 2 else 1
-                target_speed = float(row[3]) if len(row) > 3 else -1.0
-                waypoints.append((x, y, mission_type, target_speed))
-        
-        return waypoints
+            for wp_data in waypoint_data_list:
+                # WaypointData 객체를 튜플 형태로 변환
+                waypoints.append(wp_data.to_tuple())
+            
+            self.get_logger().info(f"✅ CSV 파서를 사용하여 {len(waypoints)}개 웨이포인트 로드 완료")
+            return waypoints
+            
+        except Exception as e:
+            self.get_logger().error(f"❌ CSV 파싱 오류: {e}")
+            raise
 
     def _quat_to_euler(self, q):
         t3 = 2.0 * (q.w * q.z + q.x * q.y)
@@ -772,6 +709,67 @@ class PathFollowerNode(Node):
 
     def _stop_vehicle(self):
         self.cmd_vel_pub.publish(Twist())
+
+    def update_full_path_and_velocity(self):
+        if not self.is_waiting_for_go or not self._update_vehicle_pose():
+            return
+            
+        start_x, start_y, _ = self.vehicle_pose_map
+        if not self.main_path_points:
+            self.get_logger().warn("Main path is empty, cannot generate full path.")
+            return
+
+        goal_x, goal_y = self.main_path_points[0]
+        initial_path = self._generate_straight_path((start_x, start_y), (goal_x, goal_y))
+        
+        self.full_path_points = initial_path + self.main_path_points
+        
+        # 마지막 웨이포인트의 타입에 따라 종료 속도 결정
+        final_waypoint = self.raw_waypoints[-1]
+        end_vel = 0.0 if len(final_waypoint) > 2 and final_waypoint[2] == 4 else 0.0  # 안전을 위해 항상 0으로 종료
+        
+        self.full_target_velocities = self._generate_scurve_velocity_profile(
+            self.full_path_points, start_vel=self.current_speed, end_vel=end_vel)
+        self._publish_path_visualization()
+
+    def _check_waypoint_arrival(self):
+        """웨이포인트 도달 확인 - 역할 단순화"""
+        if self.current_waypoint_idx >= len(self.raw_waypoints):
+            return
+            
+        waypoint = self.raw_waypoints[self.current_waypoint_idx]
+        wp_x, wp_y = waypoint[0], waypoint[1]
+        
+        if self.vehicle_pose_map is None:
+            return
+            
+        dist = math.hypot(self.vehicle_pose_map[0] - wp_x, self.vehicle_pose_map[1] - wp_y)
+        
+        # 특정 웨이포인트에서만 디버깅 로그 출력
+        if self.current_waypoint_idx == 2:
+            self.get_logger().info(f"🔍 Debug: WP{self.current_waypoint_idx} 거리체크 - 현재위치:({self.vehicle_pose_map[0]:.2f}, {self.vehicle_pose_map[1]:.2f}), 목표:({wp_x:.2f}, {wp_y:.2f}), 거리:{dist:.2f}m, 임계값:{self.REACH_THRESHOLD}m", throttle_duration_sec=2.0)
+        
+        if dist < self.REACH_THRESHOLD:
+            self.get_logger().info(f"✅ Waypoint {self.current_waypoint_idx} reached (distance: {dist:.2f}m).")
+            
+            # 특정 웨이포인트에서만 처리 (기존 로직 유지)
+            if len(waypoint) > 2:  # 미션 타입 정보가 있는 경우
+                mission_type = waypoint[2]
+                if mission_type == 2:  # 드론 이륙 지점
+                    self.is_mission_paused = True
+                    self.get_logger().info("🚁 Drone takeoff point reached. Vehicle paused.")
+                    self.get_logger().info(f"🔧 Debug: is_mission_paused set to {self.is_mission_paused}")
+                elif mission_type == 4:  # 최종 목적지
+                    self.is_mission_complete = True
+                    self.get_logger().info("🏁 Mission completed!")
+            
+            # 미션 완료 신호 전송 (매핑 테이블 사용)
+            if self.current_waypoint_idx in self.waypoint_mission_mapping:
+                mission_id = self.waypoint_mission_mapping[self.current_waypoint_idx]
+                self.send_mission_complete(mission_id)
+            
+            self.current_waypoint_idx += 1
+            self.last_closest_idx = self._find_closest_point_idx(self.vehicle_pose_map[0], self.vehicle_pose_map[1])
 
 def main(args=None):
     rclpy.init(args=args)

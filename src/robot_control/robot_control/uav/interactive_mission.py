@@ -37,8 +37,6 @@ class InteractiveMissionNode(BaseMissionNode):
             self.gimbal_status_callback, self.qos_profile
         )
         
-        # marker_publisher 제거 - BaseMissionNode의 visual_marker_publisher 사용
-        
         # --- 미션별 상태 변수 ---
         self.land_detected = None
         self.target_pose_map = PoseStamped()
@@ -49,16 +47,8 @@ class InteractiveMissionNode(BaseMissionNode):
         # --- Stare 기능을 위한 상태 변수 ---
         self.stare_target_index = None
         
-        # --- 목적지 좌표 (ENU) ---
-        self.waypoints = [
-            [-94.4088, 68.4708, 3.8531],     # 0번
-            [-75.4421, 74.9961, 23.2347],    # 1번
-            [-65.0308, 80.1275, 8.4990],     # 2번
-            [-82.7931, 113.4203, 3.8079],    # 3번
-            [-97.9238, 105.2799, 8.5504],    # 4번
-            [-109.1330, 100.3533, 23.1363]   # 5번
-        ]
-        self.final_destination = [-62.9630, 99.0915, 0.1349]  # 'final' 목적지
+        # --- Head 기능을 위한 상태 변수 ---
+        self.target_yaw_deg = None
         
         # --- 사용자 입력을 위한 스레드 ---
         self.input_thread = threading.Thread(target=self.command_input_loop)
@@ -66,6 +56,7 @@ class InteractiveMissionNode(BaseMissionNode):
         self.input_thread.start()
         
         self.get_logger().info("🎮 대화형 미션 컨트롤러가 실행 중입니다.")
+        self.get_logger().info(f"📍 드론 웨이포인트: {len(self.drone_waypoints)}개, 스타르 타겟: {len(self.stare_targets)}개")
         self.get_logger().info("TF 및 Local Position 데이터를 기다리는 중...")
         self.get_logger().info("💡 'start' 또는 'arm' 명령으로 드론을 시동하세요.")
     
@@ -101,17 +92,20 @@ class InteractiveMissionNode(BaseMissionNode):
         print("    arm                      - (착륙 후) 재시동")
         print("    stop                     - (비행 중) 현재 위치에 정지")
         print("  [이동 제어]")
-        print("    go <0-5|final>           - 지정 목적지로 이동 (고도 변경 포함)")
-        print("    strafe <0-5|final>       - 지정 목적지로 수평 이동 (현재 고도 유지)")
+        print("    go <0-5|final>           - 스타르 타겟으로 이동 (고도 변경 포함)")
+        print("    strafe <0-5|final>       - 스타르 타겟으로 수평 이동 (현재 고도 유지)")
+        print("    go_wp <0-6>              - 드론 웨이포인트로 이동")
+        print("    strafe_wp <0-6>          - 드론 웨이포인트로 수평 이동 (현재 고도 유지)")
         print("    climb <meters>           - 지정한 미터만큼 상대 고도 상승")
         print("    descend <meters>         - 지정한 미터만큼 상대 고도 하강")
         print("    maintain <altitude>      - 지정한 절대 고도로 이동/유지")
         print("    moveto <x> <y> <z>       - 지정한 절대좌표(map frame)로 이동")
+        print("    head <degrees>           - 현재 위치에서 지정한 각도 방향으로 회전 (0=동쪽, 90=북쪽, 180=서쪽, 270=남쪽)")
         print("  [짐벌 제어]")
-        print("    look <0-5>               - 지정 번호의 마커를 한번 바라봄")
+        print("    look <0-6>               - 지정 번호의 스타르 타겟을 한번 바라봄")
         print("    look forward             - 짐벌 정면으로 초기화")
         print("    look down                - 짐벌 수직 아래로")
-        print("    stare <0-5>              - 지정 번호의 마커를 계속 추적/응시")
+        print("    stare <0-6>              - 지정 번호의 스타르 타겟을 계속 추적/응시")
         print("    stare stop               - 추적/응시 중지")
         print("-----------------------------")
 
@@ -136,13 +130,17 @@ class InteractiveMissionNode(BaseMissionNode):
             
             # 인자가 필요한 명령어들
             elif command in ["go", "strafe"] and len(cmd) > 1:
-                self._handle_move_command(command, cmd[1])
+                self._handle_move_command(command, cmd[1], use_stare_targets=True)
+            elif command in ["go_wp", "strafe_wp"] and len(cmd) > 1:
+                self._handle_move_command(command.replace("_wp", ""), cmd[1], use_stare_targets=False)
             elif command in ["climb", "descend"] and len(cmd) > 1:
                 self._handle_altitude_change_command(command, cmd[1])
             elif command == "maintain" and len(cmd) > 1:
                 self._handle_maintain_command(cmd[1])
             elif command == "moveto" and len(cmd) > 3:
                 self._handle_moveto_command(cmd[1:])
+            elif command == "head" and len(cmd) > 1:
+                self._handle_head_command(cmd[1])
             elif command == "look" and len(cmd) > 1:
                 self._handle_look_command(cmd[1])
             elif command == "stare" and len(cmd) > 1:
@@ -178,29 +176,51 @@ class InteractiveMissionNode(BaseMissionNode):
             self.get_logger().warn(f"ARM은 LANDED 상태에서만 가능합니다. 현재 상태: {self.state}")
     
     def _handle_stop_command(self):
-        if self.state in ["IDLE", "MOVING", "TAKING_OFF"]:
+        if self.state in ["IDLE", "MOVING", "TAKING_OFF", "HEADING"]:
             if self.current_map_pose:
                 self.get_logger().info("사용자 명령: STOP. 이동 정지.")
                 self.target_pose_map = copy.deepcopy(self.current_map_pose)
+                self.target_yaw_deg = None  # yaw 제어 해제
                 self.state = "IDLE"
             else:
                 self.get_logger().warn("현재 위치를 알 수 없어 정지할 수 없습니다.")
         else:
             self.get_logger().warn(f"정지할 수 없는 상태입니다: {self.state}")
     
-    def _handle_move_command(self, command, target_str):
+    def _handle_move_command(self, command, target_str, use_stare_targets=True):
         try:
-            if self.state not in ["IDLE", "MOVING"]:
+            if self.state not in ["IDLE", "MOVING", "HEADING"]:
                 self.get_logger().warn(f"'{command}' 명령을 실행할 수 없는 상태입니다: {self.state}")
                 return
             
             if target_str == "final":
-                wp = self.final_destination
-                self.get_logger().info(f"사용자 명령: {command.upper()} to final destination.")
+                if use_stare_targets:
+                    wp = self.final_destination
+                    target_yaw = None  # 스타르 타겟으로 이동 시에는 yaw 제어 안함
+                    self.get_logger().info(f"사용자 명령: {command.upper()} to final destination (stare target).")
+                else:
+                    # 드론 웨이포인트에서는 마지막 웨이포인트 사용
+                    final_wp_index = len(self.drone_waypoints) - 1
+                    wp = self.drone_waypoints[final_wp_index].tolist()
+                    target_yaw = self.get_waypoint_yaw(final_wp_index)
+                    self.get_logger().info(f"사용자 명령: {command.upper()} to final waypoint (drone waypoint, yaw: {target_yaw:.0f}도).")
             else:
                 wp_index = int(target_str)
-                wp = self.waypoints[wp_index]
-                self.get_logger().info(f"사용자 명령: {command.upper()} to waypoint {wp_index}.")
+                if use_stare_targets:
+                    if wp_index >= len(self.stare_targets):
+                        self.get_logger().error(f"스타르 타겟 인덱스 {wp_index}가 범위를 벗어났습니다. (0-{len(self.stare_targets)-1})")
+                        return
+                    wp = self.stare_targets[wp_index]
+                    self.get_logger().info(f"사용자 명령: {command.upper()} to stare target {wp_index}.")
+                    # 스타르 타겟으로 이동 시에는 yaw 제어 안함
+                    target_yaw = None
+                else:
+                    if wp_index >= len(self.drone_waypoints):
+                        self.get_logger().error(f"드론 웨이포인트 인덱스 {wp_index}가 범위를 벗어났습니다. (0-{len(self.drone_waypoints)-1})")
+                        return
+                    wp = self.drone_waypoints[wp_index].tolist()
+                    target_yaw = self.get_waypoint_yaw(wp_index)  # 웨이포인트의 yaw 값 가져오기
+                    self.get_logger().info(f"사용자 명령: {command.upper()} to drone waypoint {wp_index} (yaw: {target_yaw:.0f}도).")
             
             self.target_pose_map.pose.position.x = wp[0]
             self.target_pose_map.pose.position.y = wp[1]
@@ -210,14 +230,16 @@ class InteractiveMissionNode(BaseMissionNode):
             elif command == "strafe":
                 self.target_pose_map.pose.position.z = self.current_map_pose.pose.position.z
             
+            # 드론 웨이포인트의 경우 yaw 적용, 스타르 타겟의 경우 yaw 제어 해제
+            self.target_yaw_deg = target_yaw if not use_stare_targets else None
             self.state = "MOVING"
             
         except (ValueError, IndexError):
-            self.get_logger().error(f"잘못된 웨이포인트 인덱스입니다. 0-{len(self.waypoints)-1} 또는 'final'을 사용하세요")
+            self.get_logger().error(f"잘못된 인덱스입니다: {target_str}")
     
     def _handle_altitude_change_command(self, command, value_str):
         try:
-            if self.state not in ["IDLE", "MOVING"]:
+            if self.state not in ["IDLE", "MOVING", "HEADING"]:
                 self.get_logger().warn(f"고도 변경을 할 수 없는 상태입니다: {self.state}")
                 return
             
@@ -227,6 +249,7 @@ class InteractiveMissionNode(BaseMissionNode):
             self.target_pose_map.pose.position.z += alt_change
             
             self.get_logger().info(f"상대 고도 변경 {alt_change:+.1f}m. 새 목표 Z: {self.target_pose_map.pose.position.z:.2f}m")
+            self.target_yaw_deg = None  # yaw 제어 해제
             self.state = "MOVING"
             
         except ValueError:
@@ -234,7 +257,7 @@ class InteractiveMissionNode(BaseMissionNode):
     
     def _handle_maintain_command(self, value_str):
         try:
-            if self.state not in ["IDLE", "MOVING"]:
+            if self.state not in ["IDLE", "MOVING", "HEADING"]:
                 self.get_logger().warn(f"고도 유지를 할 수 없는 상태입니다: {self.state}")
                 return
             
@@ -244,6 +267,7 @@ class InteractiveMissionNode(BaseMissionNode):
             self.target_pose_map.pose.position.z = target_alt
             
             self.get_logger().info(f"절대 고도 {target_alt:.2f}m로 유지합니다.")
+            self.target_yaw_deg = None  # yaw 제어 해제
             self.state = "MOVING"
             
         except ValueError:
@@ -251,7 +275,7 @@ class InteractiveMissionNode(BaseMissionNode):
     
     def _handle_moveto_command(self, args):
         try:
-            if self.state not in ["IDLE", "MOVING"]:
+            if self.state not in ["IDLE", "MOVING", "HEADING"]:
                 self.get_logger().warn(f"'moveto' 명령을 실행할 수 없는 상태입니다: {self.state}")
                 return
             
@@ -266,10 +290,44 @@ class InteractiveMissionNode(BaseMissionNode):
             self.target_pose_map.pose.position.z = z
             
             self.get_logger().info(f"사용자 명령: MOVETO to ({x:.2f}, {y:.2f}, {z:.2f}).")
+            self.target_yaw_deg = None  # yaw 제어 해제
             self.state = "MOVING"
             
         except ValueError:
             self.get_logger().error(f"moveto에 잘못된 좌표입니다. 숫자 3개를 입력하세요.")
+    
+    def _handle_head_command(self, angle_str):
+        """드론이 특정 각도 방향을 바라보도록 합니다 (현재 위치 유지)."""
+        try:
+            if self.state not in ["IDLE", "MOVING"]:
+                self.get_logger().warn(f"'head' 명령을 실행할 수 없는 상태입니다: {self.state}")
+                return
+            
+            target_yaw_deg = float(angle_str)
+            
+            # 현재 위치를 목표 위치로 설정 (위치는 유지, yaw만 변경)
+            self.target_pose_map.pose.position.x = self.current_map_pose.pose.position.x
+            self.target_pose_map.pose.position.y = self.current_map_pose.pose.position.y
+            self.target_pose_map.pose.position.z = self.current_map_pose.pose.position.z
+            
+            # 목표 yaw 각도 저장 (임시로 target_pose_map에 저장하기 위해 새로운 속성 추가)
+            self.target_yaw_deg = target_yaw_deg
+            
+            # 방향 설명 생성
+            direction_map = {
+                0: "동쪽", 45: "북동쪽", 90: "북쪽", 135: "북서쪽",
+                180: "서쪽", 225: "남서쪽", 270: "남쪽", 315: "남동쪽"
+            }
+            
+            # 가장 가까운 주요 방향 찾기
+            closest_dir = min(direction_map.keys(), key=lambda x: min(abs(target_yaw_deg - x), abs(target_yaw_deg - x + 360), abs(target_yaw_deg - x - 360)))
+            direction_desc = direction_map.get(closest_dir, f"{target_yaw_deg:.0f}도 방향")
+            
+            self.get_logger().info(f"사용자 명령: HEAD {target_yaw_deg:.0f}도 ({direction_desc})")
+            self.state = "HEADING"  # 새로운 상태 추가
+            
+        except ValueError:
+            self.get_logger().error(f"잘못된 각도 값입니다: {angle_str}")
     
     def _handle_look_command(self, sub_command):
         self.stare_target_index = None  # 'look' 명령은 항상 'stare'를 중지시킴
@@ -284,13 +342,13 @@ class InteractiveMissionNode(BaseMissionNode):
         else:
             try:
                 target_index = int(sub_command)
-                if 0 <= target_index < len(self.waypoints):
+                if 0 <= target_index < len(self.stare_targets):
                     self.get_logger().info(f"사용자 명령: LOOK {target_index}")
-                    self.point_gimbal_at_target(self.waypoints[target_index])
+                    self.point_gimbal_at_target(self.stare_targets[target_index])
                 else:
-                    self.get_logger().error(f"Look 인덱스 {target_index}가 범위를 벗어났습니다.")
+                    self.get_logger().error(f"Look 인덱스 {target_index}가 범위를 벗어났습니다. (0-{len(self.stare_targets)-1})")
             except ValueError:
-                self.get_logger().error(f"잘못된 look 명령입니다. 'forward', 'down', 또는 인덱스 0-{len(self.waypoints)-1}을 사용하세요")
+                self.get_logger().error(f"잘못된 look 명령입니다. 'forward', 'down', 또는 인덱스 0-{len(self.stare_targets)-1}을 사용하세요")
     
     def _handle_stare_command(self, sub_command):
         sub_command = sub_command.lower()
@@ -304,22 +362,22 @@ class InteractiveMissionNode(BaseMissionNode):
         else:
             try:
                 target_index = int(sub_command)
-                if 0 <= target_index < len(self.waypoints):
-                    self.get_logger().info(f"사용자 명령: STARE {target_index}. 웨이포인트를 계속 추적합니다.")
+                if 0 <= target_index < len(self.stare_targets):
+                    self.get_logger().info(f"사용자 명령: STARE {target_index}. 스타르 타겟을 계속 추적합니다.")
                     self.stare_target_index = target_index
                     # 즉시 한번 조준 실행
-                    self.point_gimbal_at_target(self.waypoints[self.stare_target_index])
+                    self.point_gimbal_at_target(self.stare_targets[self.stare_target_index])
                 else:
-                    self.get_logger().error(f"Stare 인덱스 {target_index}가 범위를 벗어났습니다.")
+                    self.get_logger().error(f"Stare 인덱스 {target_index}가 범위를 벗어났습니다. (0-{len(self.stare_targets)-1})")
             except ValueError:
-                self.get_logger().error(f"잘못된 stare 명령입니다. 'stop' 또는 인덱스 0-{len(self.waypoints)-1}을 사용하세요")
+                self.get_logger().error(f"잘못된 stare 명령입니다. 'stop' 또는 인덱스 0-{len(self.stare_targets)-1}을 사용하세요")
     
     # --- 시각화 ---
     
     def _publish_all_markers(self):
-        """모든 웨이포인트와 final_destination 위치에 마커를 게시합니다."""
+        """모든 웨이포인트와 스타르 타겟 위치에 마커를 게시합니다."""
         marker_array = visu.create_interactive_mission_markers(
-            self, self.waypoints, self.final_destination
+            self, self.drone_waypoints.tolist(), self.stare_targets, self.final_destination
         )
         self.visual_marker_publisher.publish(marker_array)
     
@@ -330,7 +388,7 @@ class InteractiveMissionNode(BaseMissionNode):
         
         # Stare 모드 실행
         if self.stare_target_index is not None and self.state in ["IDLE", "MOVING"]:
-            self.point_gimbal_at_target(self.waypoints[self.stare_target_index])
+            self.point_gimbal_at_target(self.stare_targets[self.stare_target_index])
         
         # 시각화 마커 퍼블리시
         self._publish_all_markers()
@@ -340,6 +398,8 @@ class InteractiveMissionNode(BaseMissionNode):
             self._handle_takeoff_state()
         elif self.state == "MOVING":
             self._handle_moving_state()
+        elif self.state == "HEADING":
+            self._handle_heading_state()
         elif self.state == "IDLE":
             self._handle_idle_state()
         elif self.state == "LANDING":
@@ -382,6 +442,22 @@ class InteractiveMissionNode(BaseMissionNode):
             self.get_logger().info("목적지 도착. 호버링 상태.")
             self.state = "IDLE"
     
+    def _handle_heading_state(self):
+        """방향 회전 상태 처리"""
+        target_pos = [
+            self.target_pose_map.pose.position.x,
+            self.target_pose_map.pose.position.y,
+            self.target_pose_map.pose.position.z
+        ]
+        
+        # 위치와 yaw 모두 제어
+        self.publish_position_setpoint(target_pos, self.target_yaw_deg)
+        
+        # 위치 도착 확인 (yaw는 별도로 확인하지 않고 일정 시간 후 완료로 간주)
+        if self.check_arrival(target_pos, tolerance=1.0):
+            self.get_logger().info(f"방향 회전 완료 ({self.target_yaw_deg:.0f}도). 호버링 상태.")
+            self.state = "IDLE"
+    
     def _handle_idle_state(self):
         """대기 상태 처리"""
         target_pos = [
@@ -389,7 +465,8 @@ class InteractiveMissionNode(BaseMissionNode):
             self.target_pose_map.pose.position.y,
             self.target_pose_map.pose.position.z
         ]
-        self.publish_position_setpoint(target_pos)
+        # IDLE 상태에서도 target_yaw_deg가 설정되어 있으면 yaw 제어
+        self.publish_position_setpoint(target_pos, self.target_yaw_deg)
     
     def _handle_landing_state(self):
         """착륙 상태 처리"""
@@ -416,4 +493,4 @@ def main(args=None):
 
 
 if __name__ == '__main__':
-    main() 
+    main()

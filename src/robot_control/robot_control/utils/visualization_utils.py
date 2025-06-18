@@ -307,13 +307,14 @@ def create_mission_visual_markers(node, waypoints, stare_targets=None, current_w
     return marker_array
 
 
-def create_interactive_mission_markers(node, waypoints, final_destination=None):
+def create_interactive_mission_markers(node, drone_waypoints, stare_targets, final_destination=None):
     """
-    대화형 미션용 웨이포인트 및 최종 목적지 마커들을 생성합니다.
+    대화형 미션용 드론 웨이포인트와 스타르 타겟 마커들을 생성합니다.
     
     Args:
         node: ROS2 노드 인스턴스
-        waypoints: 웨이포인트 리스트 [[x, y, z], ...]
+        drone_waypoints: 드론 웨이포인트 리스트 [[x, y, z], ...]
+        stare_targets: 스타르 타겟 리스트 [[x, y, z], ...]
         final_destination: 최종 목적지 [x, y, z] (선택사항)
         
     Returns:
@@ -322,18 +323,32 @@ def create_interactive_mission_markers(node, waypoints, final_destination=None):
     marker_array = MarkerArray()
     colors = get_waypoint_colors()
     
-    # 일반 웨이포인트들
-    for i, waypoint in enumerate(waypoints):
-        text_label = f"WP{i}\n({waypoint[0]:.2f}, {waypoint[1]:.2f}, {waypoint[2]:.2f})"
+    # 1. 드론 웨이포인트들 (녹색 구체들)
+    for i, waypoint in enumerate(drone_waypoints):
+        text_label = f"DroneWP{i}\n({waypoint[0]:.1f}, {waypoint[1]:.1f}, {waypoint[2]:.1f})"
         
-        markers = create_waypoint_visual(node, i, waypoint, "future", text_label, "waypoint")
+        # 드론 웨이포인트는 녹색으로 표시
+        markers = create_waypoint_visual(node, i, waypoint, "future", text_label, "drone_waypoints")
         marker_array.markers.extend(markers)
     
-    # 최종 목적지 (있는 경우)
-    if final_destination:
-        final_text = f"FINAL\n({final_destination[0]:.2f}, {final_destination[1]:.2f}, {final_destination[2]:.2f})"
+    # 2. 스타르 타겟들 (다양한 색상의 타겟 형태)
+    for i, target in enumerate(stare_targets):
+        color = colors[i % len(colors)]
+        text_label = f"Stare{i}\n({target[0]:.1f}, {target[1]:.1f}, {target[2]:.1f})"
         
-        final_markers = create_waypoint_visual(node, 0, final_destination, "current", final_text, "final")
+        target_markers = create_target_visual(node, i, target, color, text_label, "stare_targets")
+        marker_array.markers.extend(target_markers)
+    
+    # 3. 최종 목적지 강조 표시 (있는 경우)
+    if final_destination:
+        final_text = f"FINAL\n({final_destination[0]:.1f}, {final_destination[1]:.1f}, {final_destination[2]:.1f})"
+        
+        # 최종 목적지는 특별한 색상(골드)으로 표시
+        final_markers = create_target_visual(node, 999, final_destination, (1.0, 0.8, 0.0), final_text, "final_destination")
         marker_array.markers.extend(final_markers)
+    
+    # 4. 짐벌 방향 화살표
+    gimbal_arrow = create_gimbal_arrow_marker(node)
+    marker_array.markers.append(gimbal_arrow)
     
     return marker_array 
