@@ -60,8 +60,8 @@ class SimpleMissionControl(Node):
             'DRONE_ARMING': '드론 ARM 진행 중',
             'DRONE_TAKEOFF': '드론 이륙 중',
             'MISSION_ACTIVE': '미션 활성화 (양 플랫폼 이동)',
-            'DRONE_APPROACH': '드론 랑데뷰 지점 접근',
-            'DRONE_HOVER': '드론 최종 호버링',
+            'LANDING_STANDBY': '드론/UGV 착륙지점 대기',
+            'PRECISION_LANDING': '정밀 착륙 진행 중',
             'MISSION_COMPLETE': '미션 완료',
             'MISSION_ABORT': '미션 중단'
         }
@@ -81,6 +81,12 @@ class SimpleMissionControl(Node):
         self.drone_state = "INITIALIZING"
         self.mission_start_time = None  # ROS 시간으로 변경
         self.running = True
+
+        # --- 미션 플래그 ---
+        self.ugv_ready_for_landing = False
+        self.drone_ready_for_landing = False
+        self.landing_command_sent = False
+        self.mission_end_time = None
 
         # --- 플랫폼 데이터 (필요한 최소한만) ---
         self.drone_local_pos = None
@@ -127,6 +133,7 @@ class SimpleMissionControl(Node):
         # --- 미션 컨트롤 퍼블리셔 ---
         self.ugv_command_pub = self.create_publisher(String, '/ugv/mission_command', 10)
         self.drone_command_pub = self.create_publisher(String, '/drone/mission_command', 10)
+        self.marker_detector_command_pub = self.create_publisher(String, '/multi_tracker/command', 10)
         
         # --- 미션 상태 퍼블리셔 (Dashboard용) ---
         self.mission_status_pub = self.create_publisher(String, '/mission/status', 10)
@@ -171,6 +178,13 @@ class SimpleMissionControl(Node):
     def vehicle_state_callback(self, msg: String):
         if self.ugv_state != msg.data:
             self.get_logger().info(f"🚗 UGV 상태: {self.ugv_state} -> {msg.data}")
+            
+            # UGV가 COMPLETE 상태가 되면 랑데부 준비 완료 플래그 설정
+            if msg.data == "COMPLETE" and not self.ugv_ready_for_landing:
+                self.get_logger().info("✅ UGV 랑데부 준비 완료")
+                self.ugv_ready_for_landing = True
+                self._check_and_start_landing()
+                
         self.ugv_state = msg.data
 
     def mission_complete_callback(self, request, response):
@@ -202,13 +216,13 @@ class SimpleMissionControl(Node):
                 'message': "✅ UGV 미션 완료"
             },
             self.MISSION_IDS['DRONE_APPROACH_COMPLETE']: {
-                'expected_states': ['MISSION_ACTIVE', 'DRONE_APPROACH', 'DRONE_HOVER', 'MISSION_COMPLETE'],
-                'next_state': 'DRONE_HOVER',
-                'action': None,
-                'message': "✅ 드론 랑데뷰 지점 도착"
+                'expected_states': ['MISSION_ACTIVE', 'LANDING_STANDBY'],
+                'next_state': 'LANDING_STANDBY',
+                'action': self._set_drone_ready_for_landing,
+                'message': "✅ 드론 최종 지점 도착. UGV 도착 대기."
             },
             self.MISSION_IDS['DRONE_HOVER_COMPLETE']: {
-                'expected_states': ['DRONE_HOVER', 'MISSION_COMPLETE'],
+                'expected_states': ['LANDING_STANDBY', 'PRECISION_LANDING', 'MISSION_COMPLETE'],
                 'next_state': 'MISSION_COMPLETE',
                 'action': None,
                 'message': "🎯 미션 완료!"
@@ -355,8 +369,34 @@ class SimpleMissionControl(Node):
         """미션 상태 리셋"""
         self.mission_state = 'READY'
         self.mission_start_time = None
+        self.mission_end_time = None
+        self.ugv_ready_for_landing = False
+        self.drone_ready_for_landing = False
+        self.landing_command_sent = False
         self.publish_mission_status()
         self.get_logger().info("🔄 미션 상태 리셋")
+
+    def _set_drone_ready_for_landing(self):
+        """드론 랑데부 준비완료 플래그를 설정하고, 착륙 시작 조건을 확인합니다."""
+        if not self.drone_ready_for_landing:
+            self.get_logger().info("✅ 드론 랑데부 준비 완료")
+            self.drone_ready_for_landing = True
+            self._check_and_start_landing()
+
+    def _check_and_start_landing(self):
+        """UGV와 드론이 모두 준비되었는지 확인하고 정밀 착륙을 시작합니다."""
+        if self.ugv_ready_for_landing and self.drone_ready_for_landing and not self.landing_command_sent:
+            self.get_logger().info("🚀 모든 플랫폼 준비 완료. 정밀 착륙 시퀀스 시작!")
+            self.mission_state = 'PRECISION_LANDING'
+            self.publish_mission_status()
+            
+            # 드론에 정밀 착륙 시작 명령 전송
+            self.drone_command_pub.publish(String(data='start_precision_landing'))
+            
+            # 마커 탐지기에 탐지 시작 명령 전송
+            self.marker_detector_command_pub.publish(String(data='DETECT_LANDING_MARKER'))
+            
+            self.landing_command_sent = True
 
 
 def main(args=None):

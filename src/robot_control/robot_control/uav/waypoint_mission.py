@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 """
-웨이포인트 자동 순회 미션 노드
-지정된 웨이포인트를 순서대로 방문하며, 각 지점에서 주시 타겟을 응시하고 호버링하는 자동 미션을 수행합니다.
+웨이포인트 자동 순회 및 정밀 착륙 미션 노드
+지정된 웨이포인트를 순서대로 방문하고, 마지막 지점에서 아루코 마커를 이용해 정밀 착륙을 수행합니다.
 """
 
 import rclpy
 import threading
 import sys
+import math
 
 from std_msgs.msg import String
+from vision_msgs.msg import Detection3DArray
+from px4_msgs.msg import VehicleLandDetected  # 착륙 감지 메시지
 from mission_admin_interfaces.srv import MissionComplete
+from rcl_interfaces.msg import ParameterDescriptor
 
 from .base_mission_node import BaseMissionNode
 from ..utils import drone_control_utils as dcu
@@ -18,8 +22,9 @@ from ..utils import visualization_utils as visu
 
 class WaypointMissionNode(BaseMissionNode):
     """
-    웨이포인트 기반 자동 미션을 수행하는 노드.
+    웨이포인트 기반 자동 미션 및 정밀 착륙을 수행하는 노드.
     지정된 웨이포인트로 이동하며, 각 지점에서 Stare 타겟을 응시하고 2초간 호버링합니다.
+    마지막 웨이포인트에서는 ArUco 마커를 이용한 정밀 착륙을 수행합니다.
     """
     
     def __init__(self):
@@ -28,6 +33,11 @@ class WaypointMissionNode(BaseMissionNode):
         # --- 추가 서브스크라이버 (미션 컨트롤 연동) ---
         self.mission_command_sub = self.create_subscription(
             String, "/drone/mission_command", self.mission_command_callback, 10
+        )
+        
+        # --- PX4 상태 구독자 ---
+        self.land_detector_sub = self.create_subscription(
+            VehicleLandDetected, "/fmu/out/vehicle_land_detected", self._land_detected_callback, 10
         )
         
         # --- 미션 컨트롤 서비스 클라이언트 ---
@@ -41,14 +51,74 @@ class WaypointMissionNode(BaseMissionNode):
         self.declare_parameter('gimbal_camera_frame', 'x500_gimbal_0/camera_link')
         self.gimbal_camera_frame_id = self.get_parameter('gimbal_camera_frame').value
         
+        # --- 정밀 착륙 관련 변수 및 파라미터 ---
+        self.declare_parameter('landing_altitude', 0.5)
+        self.declare_parameter('descent_speed', 7.0, 
+            ParameterDescriptor(description="마커 정렬 후 최종 착륙 시 하강 속도 (m/s)"))
+        self.declare_parameter('horizontal_tolerance', 0.15)
+        self.declare_parameter('vertical_tolerance', 0.3)
+        self.declare_parameter('landing_marker_id', 6)  # 착륙용 마커 ID
+        self.declare_parameter('search_descent_speed', 7.0, 
+            ParameterDescriptor(description="마커를 탐색하며 하강할 때의 속도 (m/s)"))
+        self.declare_parameter('precision_horizontal_tolerance', 0.1)  # 정밀 착륙 시 수평 허용 오차
+        
+        self.landing_altitude = self.get_parameter('landing_altitude').value
+        self.descent_speed = self.get_parameter('descent_speed').value
+        self.horizontal_tolerance = self.get_parameter('horizontal_tolerance').value
+        self.vertical_tolerance = self.get_parameter('vertical_tolerance').value
+        self.landing_marker_id = self.get_parameter('landing_marker_id').value
+        self.search_descent_speed = self.get_parameter('search_descent_speed').value
+        self.precision_horizontal_tolerance = self.get_parameter('precision_horizontal_tolerance').value
+        
+        self.landing_marker_pose = None
+        self.last_marker_detection_time = None
+        self.precision_landing_start_altitude = None
+        self.land_command_issued = False # land 명령 중복 전송 방지 플래그
+        
+        # --- 마커 위치 구독자 ---
+        self.marker_detection_sub = self.create_subscription(
+            Detection3DArray, "/marker_detections", self._marker_detection_callback, 10
+        )
+        
         # --- 커맨드 입력 스레드 (간단한 제어용) ---
         self.input_thread = threading.Thread(target=self.command_input_loop)
         self.input_thread.daemon = True
         self.input_thread.start()
         
-        self.get_logger().info("🛩️ 웨이포인트 미션 컨트롤러가 초기화되었습니다.")
+        self.get_logger().info("🛩️ 웨이포인트 미션 및 정밀 착륙 컨트롤러가 초기화되었습니다.")
         self.get_logger().info(f"📍 총 {len(self.drone_waypoints)}개의 웨이포인트가 설정되었습니다.")
+        self.get_logger().info(f"🎯 착륙 마커 ID: {self.landing_marker_id}, 착륙 고도: {self.landing_altitude}m")
     
+    def _land_detected_callback(self, msg: VehicleLandDetected):
+        """PX4의 착륙 상태를 감지하는 콜백"""
+        # PRECISION_LANDING 또는 LANDING 상태이고, PX4가 착륙을 감지했으며, 아직 미션 완료 전일 때
+        if self.state in ["PRECISION_LANDING", "LANDING"] and msg.landed and self.state != "MISSION_COMPLETE":
+            self.get_logger().info("✅ PX4 컨트롤러가 착륙 완료를 감지했습니다.")
+            self.on_mission_complete()
+
+    def _marker_detection_callback(self, msg: Detection3DArray):
+        """마커 탐지 토픽 콜백 함수"""
+        if not msg.detections:
+            return
+            
+        # 착륙 마커 ID와 일치하는 마커를 찾습니다
+        for detection in msg.detections:
+            if detection.results:
+                for result in detection.results:
+                    try:
+                        marker_id = int(result.hypothesis.class_id)
+                        if marker_id == self.landing_marker_id:
+                            self.landing_marker_pose = result.pose.pose
+                            self.last_marker_detection_time = self.get_clock().now()
+                            self.get_logger().debug(f"착륙 마커 {marker_id} 탐지: "
+                                                  f"({self.landing_marker_pose.position.x:.2f}, "
+                                                  f"{self.landing_marker_pose.position.y:.2f}, "
+                                                  f"{self.landing_marker_pose.position.z:.2f})")
+                            return
+                    except (ValueError, AttributeError) as e:
+                        self.get_logger().debug(f"마커 ID 파싱 오류: {e}")
+                        continue
+
     # --- 미션 컨트롤 연동 ---
     
     def mission_command_callback(self, msg: String):
@@ -69,6 +139,19 @@ class WaypointMissionNode(BaseMissionNode):
             if self.state not in ["LANDING", "LANDED"]:
                 self.get_logger().info("⛔ 미션 컨트롤로부터 LAND 명령 수신")
                 self.emergency_land()
+        
+        elif command == 'start_precision_landing':
+            if self.state == "AWAITING_LANDING_COMMAND":
+                self.get_logger().info("🎯 정밀 착륙 시작 명령 수신!")
+                self.state = "PRECISION_LANDING"
+                # 착륙 시작 고도 기록
+                if self.current_map_pose:
+                    self.precision_landing_start_altitude = self.current_map_pose.pose.position.z
+            else:
+                self.get_logger().warn(f"정밀 착륙을 시작할 수 없는 상태입니다: {self.state}")
+                
+        elif command == 'ugv_arrived':
+            self.get_logger().info("🚗 UGV 랑데부 도착 신호 수신 - 하강 허가됨")
     
     def send_mission_complete(self, mission_id: int):
         """미션 완료 신호를 미션 컨트롤에 전송"""
@@ -150,8 +233,13 @@ class WaypointMissionNode(BaseMissionNode):
             self._handle_moving_to_waypoint_state()
         elif self.state == "HOVERING_AT_WAYPOINT":
             self._handle_hovering_at_waypoint_state()
-        elif self.state == "MISSION_COMPLETE_HOVER":
-            self._handle_mission_complete_hover_state()
+        elif self.state == "AWAITING_LANDING_COMMAND":
+            self._handle_awaiting_landing_command_state()
+        elif self.state == "PRECISION_LANDING":
+            self._handle_precision_landing_state()
+        elif self.state == "LANDING":
+            # LANDING 상태에서는 PX4가 착륙을 완료할 때까지 대기
+            self.get_logger().info("🛬 PX4 자동 착륙 진행 중... 지상 감지 대기", throttle_duration_sec=5.0)
     
     def _handle_takeoff_state(self):
         """이륙 상태 처리"""
@@ -167,8 +255,9 @@ class WaypointMissionNode(BaseMissionNode):
             if abs(self.current_map_pose.pose.position.z - takeoff_altitude) < 1.0:
                 self.get_logger().info(f"🚁 이륙 완료. 첫 번째 웨이포인트 {self.current_waypoint_index}로 이동.")
                 # 미션 컨트롤에 이륙 완료 신호 전송
-                self.send_mission_complete(2)  # DRONE_TAKEOFF_COMPLETE
+                self.send_mission_complete(2) # DRONE_TAKEOFF_COMPLETE
                 self.state = "MOVING_TO_WAYPOINT"
+        self.get_logger().info("⏳ 최종 지점에서 호버링하며 착륙 명령 대기 중...", throttle_duration_sec=10.0)
     
     def _handle_moving_to_waypoint_state(self):
         """웨이포인트로 이동 상태 처리"""
@@ -213,35 +302,93 @@ class WaypointMissionNode(BaseMissionNode):
             self.current_waypoint_index += 1
             
             if self.current_waypoint_index >= len(self.drone_waypoints):
-                self.get_logger().info("🏁 모든 웨이포인트 방문 완료. 현재 위치에서 호버링 시작.")
-                self.state = "MISSION_COMPLETE_HOVER"
-                # 미션 컨트롤에 랑데뷰 지점 도착 및 호버링 완료 신호 전송
+                self.get_logger().info("🏁 모든 웨이포인트 방문 완료. 최종 지점에서 착륙 명령 대기.")
+                self.state = "AWAITING_LANDING_COMMAND"
+                # 미션 컨트롤에 랑데부 지점 도착 신호 전송
                 self.send_mission_complete(4)  # DRONE_APPROACH_COMPLETE
-                self.send_mission_complete(5)  # DRONE_HOVER_COMPLETE
             else:
                 self.get_logger().info(f"호버링 완료. 다음 웨이포인트로 이동: {self.current_waypoint_index}")
                 self.state = "MOVING_TO_WAYPOINT"
             
             self.hover_start_time = None
     
-    def _handle_mission_complete_hover_state(self):
-        """미션 완료 후 호버링 상태 처리"""
-        # 마지막 웨이포인트에서 계속 호버링 (무한 호버링)
+    def _handle_awaiting_landing_command_state(self):
+        """착륙 명령 대기 상태 처리"""
+        # 마지막 웨이포인트에서 계속 호버링
         final_wp_index = len(self.drone_waypoints) - 1
-        final_stare_idx = self.stare_indices[final_wp_index]
-        final_stare_pos = self.stare_targets[final_stare_idx]
-        
         self.publish_waypoint_setpoint(final_wp_index)
-        self.point_gimbal_at_target(final_stare_pos)
         
-        self.get_logger().info("✈️ 미션 완료 - 마지막 웨이포인트에서 호버링 중...", throttle_duration_sec=10.0)
+        self.get_logger().info("⏳ 최종 지점에서 호버링하며 착륙 명령 대기 중...", throttle_duration_sec=10.0)
+
+    def _handle_precision_landing_state(self):
+        """정밀 착륙 상태 처리 - 마커 탐색 및 정렬 기능 포함"""
+        if not self.current_map_pose:
+            self.get_logger().warn("현재 위치 정보가 없습니다. 정밀 착륙을 진행할 수 없습니다.")
+            return
+
+        # land 명령이 이미 보내졌다면, PX4가 제어권을 가지므로 더 이상 setpoint를 보내지 않음
+        if self.land_command_issued:
+            return
+
+        current_pos = self.current_map_pose.pose.position
+
+        # 첫 진입 시 짐벌을 아래로 향하게 설정
+        if self.precision_landing_start_altitude is not None:
+            dcu.point_gimbal_down(self)
+            self.get_logger().info("🎯 정밀 착륙 모드 시작 - 짐벌을 아래로 향하게 설정")
+            self.precision_landing_start_altitude = None  # 한 번만 실행
+
+        # 마커 탐지 여부 확인 (2초 이내)
+        marker_detected = (self.landing_marker_pose is not None and
+                          self.last_marker_detection_time is not None and
+                          (self.get_clock().now() - self.last_marker_detection_time).nanoseconds / 1e9 < 2.0)
+
+        if not marker_detected:
+            # 마커 미탐지: 마지막 웨이포인트 위치에서 하강하며 탐색
+            self.get_logger().info(f"🔍 마커를 찾을 수 없습니다. 고도를 낮추며 탐색합니다. (속도: {self.search_descent_speed} m/s)",
+                                 throttle_duration_sec=2.0)
+
+            target_pos = [
+                current_pos.x,
+                current_pos.y,
+                max(self.landing_altitude, current_pos.z - self.search_descent_speed * 0.1) # 10Hz 제어 가정
+            ]
+            self.publish_position_setpoint(target_pos)
+            return
+
+        # --- 마커 탐지됨 ---
+        # multi_tracker가 'map' 프레임 기준으로 마커의 절대 좌표를 발행해줌
+        marker_world_pos = self.landing_marker_pose.position
+        
+        h_error = math.sqrt((marker_world_pos.x - current_pos.x)**2 + (marker_world_pos.y - current_pos.y)**2)
+        relative_altitude = current_pos.z - marker_world_pos.z
+
+        # 최종 착륙 조건: 마커와의 상대 고도가 3m 미만이고, 수평 오차가 허용치 이내일 때
+        if relative_altitude < 3.0 and h_error < self.precision_horizontal_tolerance:
+            self.get_logger().info(f"🛬 최종 착륙 조건 만족 (상대고도: {relative_altitude:.2f}m, 수평오차: {h_error:.2f}m). PX4 자동 착륙 시작.")
+            dcu.land_drone(self)
+            self.land_command_issued = True # land 명령 중복 전송 방지
+            self.state = "LANDING" # 상태를 LANDING으로 변경
+            return
+
+        # 위 조건이 만족되지 않으면, 계속해서 마커를 향해 정렬하며 하강
+        target_altitude = max(self.landing_altitude, current_pos.z - self.descent_speed * 0.1)
+        target_pos = [marker_world_pos.x, marker_world_pos.y, target_altitude]
+
+        self.publish_position_setpoint(target_pos)
+        self.get_logger().info(f"🎯 마커 정렬 및 하강 - 상대고도: {relative_altitude:.2f}m, 수평오차: {h_error:.3f}m",
+                             throttle_duration_sec=1.0)
     
     # --- 오버라이드 메서드 ---
     
     def on_mission_complete(self):
         """미션 완료 시 추가 처리"""
+        if self.state == "MISSION_COMPLETE":
+            return # 중복 호출 방지
+            
         super().on_mission_complete()
         self.get_logger().info("🎯 웨이포인트 미션이 성공적으로 완료되었습니다!")
+        self.send_mission_complete(5) # DRONE_HOVER_COMPLETE (미션 완료 신호)
 
 
 def main(args=None):

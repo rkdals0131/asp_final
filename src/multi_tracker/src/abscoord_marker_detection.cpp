@@ -34,16 +34,24 @@ MultiTrackerNode::MultiTrackerNode()
         _camera_info_topic, image_qos,
         std::bind(&MultiTrackerNode::camera_info_callback, this, std::placeholders::_1));
 
+    _command_sub = this->create_subscription<std_msgs::msg::String>(
+        "/multi_tracker/command", 10,
+        std::bind(&MultiTrackerNode::command_callback, this, std::placeholders::_1));
+
     _marker_detections_pub = this->create_publisher<vision_msgs::msg::Detection3DArray>(_marker_detections_topic, pose_qos);
     _image_pub = this->create_publisher<sensor_msgs::msg::Image>(_image_proc_topic, image_qos);
+    
+    RCLCPP_INFO(this->get_logger(), "MultiTrackerNode initialized with landing mode support");
 }
 
 void MultiTrackerNode::loadParameters()
 {
     declare_parameter<int>("dictionary", 0);
     declare_parameter<double>("marker_size", 1.0);
+    declare_parameter<double>("landing_marker_size", 0.5);
     get_parameter("dictionary", _param_dictionary);
     get_parameter("marker_size", _param_marker_size);
+    get_parameter("landing_marker_size", _param_landing_marker_size);
 
     declare_parameter<std::string>("image_topic", "/world/default/model/x500_gimbal_0/link/camera_link/sensor/camera/image");
     declare_parameter<std::string>("camera_info_topic", "/world/default/model/x500_gimbal_0/link/camera_link/sensor/camera/camera_info");
@@ -108,7 +116,9 @@ void MultiTrackerNode::image_callback(const sensor_msgs::msg::Image::SharedPtr m
 
         for (size_t i = 0; i < ids.size(); i++) { // 감지된 모든 마커에 대해
             // Step 2: Estimate the marker's pose using solvePnP (returns pose in camera's optical frame)
-            float half_size = _param_marker_size / 2.0f;
+            // Use conditional marker size based on landing mode
+            float marker_size = _is_landing_mode ? _param_landing_marker_size : _param_marker_size;
+            float half_size = marker_size / 2.0f;
             std::vector<cv::Point3f> objectPoints = {
                 cv::Point3f(-half_size,  half_size, 0), cv::Point3f( half_size,  half_size, 0),
                 cv::Point3f( half_size, -half_size, 0), cv::Point3f(-half_size, -half_size, 0)
@@ -173,13 +183,15 @@ void MultiTrackerNode::image_callback(const sensor_msgs::msg::Image::SharedPtr m
     if (!ids.empty()) {
         for (size_t i = 0; i < ids.size(); ++i) {
             cv::Vec3d rvec, tvec;
-            float half_size = _param_marker_size / 2.0f;
+            // Use conditional marker size based on landing mode
+            float marker_size = _is_landing_mode ? _param_landing_marker_size : _param_marker_size;
+            float half_size = marker_size / 2.0f;
             std::vector<cv::Point3f> objectPoints = {
                 cv::Point3f(-half_size,  half_size, 0), cv::Point3f( half_size,  half_size, 0),
                 cv::Point3f( half_size, -half_size, 0), cv::Point3f(-half_size, -half_size, 0)
             };
             cv::solvePnP(objectPoints, corners[i], _camera_matrix, _dist_coeffs, rvec, tvec);
-            cv::drawFrameAxes(cv_ptr->image, _camera_matrix, _dist_coeffs, rvec, tvec, _param_marker_size);
+            cv::drawFrameAxes(cv_ptr->image, _camera_matrix, _dist_coeffs, rvec, tvec, marker_size);
         }
     }
     
@@ -199,6 +211,14 @@ void MultiTrackerNode::camera_info_callback(const sensor_msgs::msg::CameraInfo::
     _camera_matrix = cv::Mat(3, 3, CV_64F, const_cast<double*>(msg->k.data())).clone();
     _dist_coeffs = cv::Mat(msg->d.size(), 1, CV_64F, const_cast<double*>(msg->d.data())).clone();
     RCLCPP_INFO_ONCE(this->get_logger(), "Successfully received camera intrinsic parameters.");
+}
+
+void MultiTrackerNode::command_callback(const std_msgs::msg::String::SharedPtr msg)
+{
+    if (msg->data == "DETECT_LANDING_MARKER") {
+        RCLCPP_INFO(this->get_logger(), "Landing mode activated. Using landing marker size (%.2fm).", _param_landing_marker_size);
+        _is_landing_mode = true;
+    }
 }
 
 int main(int argc, char * argv[])
