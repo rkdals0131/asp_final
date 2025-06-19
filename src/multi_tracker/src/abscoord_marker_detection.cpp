@@ -41,7 +41,7 @@ MultiTrackerNode::MultiTrackerNode()
 void MultiTrackerNode::loadParameters()
 {
     declare_parameter<int>("dictionary", 0);
-    declare_parameter<double>("marker_size", 0.5);
+    declare_parameter<double>("marker_size", 1.0);
     get_parameter("dictionary", _param_dictionary);
     get_parameter("marker_size", _param_marker_size);
 
