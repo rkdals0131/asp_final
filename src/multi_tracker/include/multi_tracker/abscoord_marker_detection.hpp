@@ -27,8 +27,8 @@ public:
     MultiTrackerNode();
 
     // Public accessors for stored marker coordinates
-    const std::map<int, tf2::Transform>& getMarkerFromOpticalTransforms() const { return _T_marker_from_optical_map; }
-    const std::map<int, tf2::Transform>& getOpticalFromMarkerTransforms() const { return _T_optical_from_marker_map; }
+    const std::map<int, tf2::Transform>& getMarkerFromCameraRdfTransforms() const { return _T_marker_from_camera_rdf_map; }
+    const std::map<int, tf2::Transform>& getCameraRdfFromMarkerTransforms() const { return _T_camera_rdf_from_marker_map; }
     const std::map<int, tf2::Transform>& getMapFromMarkerTransforms() const { return _T_map_from_marker_map; }
 
 private:
@@ -45,12 +45,11 @@ private:
     // TF
     std::unique_ptr<tf2_ros::Buffer> _tf_buffer;
     std::shared_ptr<tf2_ros::TransformListener> _tf_listener{nullptr};
-    tf2::Transform _T_physical_from_optical;
 
     // Marker position storage
-    std::map<int, tf2::Transform> _T_optical_from_marker_map;  // 마커 기준 드론(카메라) 위치
-    std::map<int, tf2::Transform> _T_marker_from_optical_map;  // 드론(카메라) 기준 마커 위치
-    std::map<int, tf2::Transform> _T_map_from_marker_map;      // 맵 기준 마커 위치
+    std::map<int, tf2::Transform> _T_camera_rdf_from_marker_map;  // 마커 기준 카메라 RDF 위치
+    std::map<int, tf2::Transform> _T_marker_from_camera_rdf_map;  // 카메라 RDF 기준 마커 위치
+    std::map<int, tf2::Transform> _T_map_from_marker_map;         // 맵 기준 마커 위치
 
     // OpenCV / Aruco
     cv::Mat _camera_matrix;
@@ -67,7 +66,6 @@ private:
     std::string _camera_info_topic;
     std::string _image_proc_topic;
     std::string _marker_detections_topic;
-    std::string _drone_frame_id;
 };
 
 #endif // MULTI_TRACKER_NODE_HPP_

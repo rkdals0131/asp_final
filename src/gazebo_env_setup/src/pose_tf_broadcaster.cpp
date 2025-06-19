@@ -74,8 +74,12 @@ private:
       original_transform.transform.rotation.w
     );
     
-    // RDF 변환 행렬을 쿼터니언으로 변환
-    // rotation_matrix_rdf = [[0, 0, -1], [1, 0, 0], [0, -1, 0]]
+    // BRU -> RDF 변환 행렬을 쿼터니언으로 변환
+    // rotation_matrix_rdf = [
+    // [0, 0, -1], 
+    // [1, 0, 0], 
+    // [0, -1, 0]
+    // ]
     // 이는 Y축으로 90도, X축으로 -90도 회전과 동일
     tf2::Quaternion rdf_rotation;
     rdf_rotation.setRPY(-M_PI/2, 0, M_PI/2);  // RDF 변환
