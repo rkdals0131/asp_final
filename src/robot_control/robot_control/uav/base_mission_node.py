@@ -10,6 +10,7 @@ from rclpy.node import Node
 from rclpy.parameter import Parameter
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from abc import ABC, abstractmethod
+from rclpy.duration import Duration
 
 # ROS2 메시지 임포트
 from px4_msgs.msg import OffboardControlMode, TrajectorySetpoint, VehicleCommand, VehicleLocalPosition, VehicleAttitude
@@ -97,6 +98,11 @@ class BaseMissionNode(Node, ABC):
         self.current_local_pos = None
         self.current_attitude = None
         self.drone_frame_id = drone_frame_id
+        self.vehicle_frame_id = "X1_asp"  # UGV 프레임 ID 추가
+        
+        # --- 착륙 감지 관련 변수 ---
+        self.landed_check_start_time = None
+        self.landed_check_duration = Duration(seconds=2.0)
         
         # --- 핸드셰이크 관련 변수 ---
         self.handshake_counter = 0
@@ -115,17 +121,15 @@ class BaseMissionNode(Node, ABC):
         # 미션 정의: (x, y, z, yaw, stare_index)
         # yaw는 맵 좌표계 기준 (X축이 0도, 반시계방향이 양수)
         self.mission_definition = [
-            (-100, 80, 20, 315, 0),  #wp 0
-            (-80, 80, 30, 315, 1),   #wp 1
+            (-95, 80, 17, 315, 0),  #wp 0
+            (-80, 80, 33, 315, 1),   #wp 1
             (-63, 75, 25, 180, 2),   #wp 2
             (-55, 72, 15, 180, 3),   #wp 3
-            (-55, 72, 15, 180, 4),   #wp 4
-            (-70, 112, 15, 160, 5),  #wp 5
-            (-85, 100, 15, 170, 6),  #wp 6
-            (-85, 100, 15, 170, 7),  #wp 7
-            (-93, 96, 22, 170, 8),   #wp 8
-            (-113, 95, 30, 20, 9),   #wp 9
-            (-63, 100, 10, 270, 10),  #wp 10
+            (-70, 100, 17, 160, 4),  #wp 4
+            (-90, 100, 17, 170, 5),  #wp 5
+            (-93, 96, 22, 170, 6),   #wp 6
+            (-100, 95, 30, 170, 7),   #wp 7
+            (-63, 100, 10, 270, 8),  #wp 8
         ]
         
         # 드론 웨이포인트 (x, y, z 좌표만 추출)
@@ -143,13 +147,11 @@ class BaseMissionNode(Node, ABC):
             [-75.4421, 74.9961, 23.2347],   #1
             [-75.0, 75.0, 20.0],             #2
             [-75.0, 75.0, 10.0],             #3
-            [-65.0308, 80.1275, 8.4990],    #4
-            [-82.7931, 113.4203, 3.8079],   #5
-            [-97.9238, 105.2799, 8.5504],   #6
-            [-109.0, 100.0, 12.0],           #7
-            [-109.0, 100.0, 19.0],           #8
-            [-109.1330, 100.3533, 23.1363], #9
-            [-62.9630, 99.0915, 0.1349]     #10
+            [-82.7931, 113.4203, 3.8079],   #4
+            [-97.9238, 105.2799, 8.5504],   #5
+            [-109.0, 100.0, 19.0],           #6
+            [-109.1330, 100.3533, 23.1363], #7
+            [-62.9630, 99.0915, 0.1349]     #8
         ]
         
         # 최종 목적지 (편의를 위한 별칭)
@@ -212,7 +214,7 @@ class BaseMissionNode(Node, ABC):
         self.state_publisher.publish(String(data=self.state))
         
         # Offboard 제어 모드 퍼블리시 (특정 상태 제외)
-        if self.state not in ["LANDING", "LANDED", "INIT"]:
+        if self.state not in ["LANDING", "LANDED", "INIT", "DISARMED"]:
             dcu.publish_offboard_control_mode(self)
         
         # 공통 상태 처리
@@ -256,13 +258,65 @@ class BaseMissionNode(Node, ABC):
         elif self.state == "LANDING":
             self.get_logger().info("🛬 착륙 중...", throttle_duration_sec=5.0)
             dcu.land_drone(self)
-            # 착륙 감지는 자식 클래스에서 구현
+            self.check_landed_on_vehicle() # UGV 위 착륙 감지 로직 호출
             
         elif self.state == "LANDED":
-            self.get_logger().info("✅ 착륙 완료.", once=True)
+            self.get_logger().info("✅ 착륙 완료. Disarm 실행.")
+            dcu.disarm_drone(self)
+            self.state = "DISARMED"
+            
+        elif self.state == "DISARMED":
+            self.get_logger().info("✅ 시동 꺼짐. 미션 종료.", once=True)
+            # 최종 상태, 아무것도 하지 않음
+            pass
     
     # --- 유틸리티 메서드들 ---
     
+    def check_landed_on_vehicle(self, xy_tolerance=0.5, z_tolerance=0.6, vel_tolerance=0.2):
+        """UGV 위에 착륙했는지 상대 거리와 속도를 기준으로 확인합니다."""
+        try:
+            # UGV의 TF 조회
+            vehicle_trans = self.tf_buffer.lookup_transform(
+                'map', f"{self.vehicle_frame_id}/base_link", rclpy.time.Time()
+            )
+            
+            # 드론과 UGV 간의 거리 계산
+            dx = self.current_map_pose.pose.position.x - vehicle_trans.transform.translation.x
+            dy = self.current_map_pose.pose.position.y - vehicle_trans.transform.translation.y
+            dz = self.current_map_pose.pose.position.z - vehicle_trans.transform.translation.z
+            dist_xy = np.sqrt(dx**2 + dy**2)
+            dist_z = abs(dz)
+
+            # 수직 속도 확인
+            vz = self.current_local_pos.vz if self.current_local_pos else 1.0
+
+            # 디버깅 로그 추가
+            self.get_logger().info(f"[LANDING_CHECK] dist_xy: {dist_xy:.3f}m, dist_z: {dist_z:.3f}m, vz: {vz:.3f}m/s", throttle_duration_sec=1.0)
+
+            # 착륙 조건 확인
+            if dist_xy < xy_tolerance and dist_z < z_tolerance and abs(vz) < vel_tolerance:
+                now = self.get_clock().now()
+                if self.landed_check_start_time is None:
+                    self.landed_check_start_time = now
+                    self.get_logger().info("착륙 가능성 감지. 안정화 상태 확인 시작...")
+                
+                # 일정 시간 동안 조건이 유지되었는지 확인
+                if now - self.landed_check_start_time > self.landed_check_duration:
+                    self.get_logger().info("✅ UGV 위 착륙 확인! 상태를 LANDED로 변경합니다.")
+                    self.state = "LANDED"
+            else:
+                # 조건이 깨지면 타이머 리셋
+                if self.landed_check_start_time is not None:
+                    self.get_logger().info("착륙 조건 벗어남. 타이머 리셋.")
+                self.landed_check_start_time = None
+
+        except TransformException as e:
+            self.get_logger().warn(
+                f"UGV TF({self.vehicle_frame_id}) 조회 실패: {e}",
+                throttle_duration_sec=2.0
+            )
+            self.landed_check_start_time = None
+
     def start_mission(self):
         """미션을 시작합니다 (INIT → HANDSHAKE)."""
         if self.state == "INIT":

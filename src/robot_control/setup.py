@@ -38,6 +38,8 @@ setup(
             'waypoint_mission_node = robot_control.uav.waypoint_mission:main',
             
             'path_follower_node = robot_control.ugv.path_follower_node:main',
+            
+            'marker_visual_node = robot_control.utils.marker_visual:main',
         ],
     },
 )

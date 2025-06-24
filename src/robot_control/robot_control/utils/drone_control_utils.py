@@ -8,6 +8,7 @@ import math
 import rclpy
 from px4_msgs.msg import VehicleCommand, OffboardControlMode, TrajectorySetpoint
 from geometry_msgs.msg import PoseStamped
+from rclpy.node import Node
 
 
 # === 각도 변환 유틸리티 함수들 ===
@@ -321,11 +322,16 @@ def arm_and_offboard(node):
     publish_vehicle_command(node, VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM, param1=1.0)
 
 
-def land_drone(node):
-    """
-    드론 착륙 명령을 전송합니다.
-    """
+def land_drone(node: Node):
+    """드론에게 착륙 명령을 보냅니다."""
+    node.get_logger().debug("LAND 명령 전송")
     publish_vehicle_command(node, VehicleCommand.VEHICLE_CMD_NAV_LAND)
+
+
+def disarm_drone(node: Node):
+    """드론에게 Disarm 명령을 보냅니다."""
+    node.get_logger().debug("DISARM 명령 전송")
+    publish_vehicle_command(node, VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM, param1=0.0)
 
 
 def reset_gimbal(node):
@@ -377,6 +383,36 @@ def set_gimbal_angle(node, pitch_deg=0.0, yaw_deg=0.0, roll_deg=0.0):
         param3=yaw_deg,    # Yaw (body frame)
         param7=2.0         # MAV_MOUNT_MODE_MAVLINK_TARGETING
     )
+
+
+def enu_to_local_frame(map_pos, current_local_pos, current_map_pose):
+    """
+    Map(ENU) 좌표를 드론의 Local 프레임 좌표로 변환합니다.
+    
+    Args:
+        map_pos: Map(ENU) 좌표 [x, y, z]
+        current_local_pos: 현재 드론의 local NED 위치
+        current_map_pose: 현재 드론의 map 좌표계 위치
+        
+    Returns:
+        list: [target_ned_x, target_ned_y, target_ned_z] local NED 좌표
+    """
+    # Map 좌표계에서의 변위 계산
+    delta_map_x = map_pos[0] - current_map_pose.pose.position.x
+    delta_map_y = map_pos[1] - current_map_pose.pose.position.y
+    delta_map_z = map_pos[2] - current_map_pose.pose.position.z
+    
+    # ENU to NED 변환 적용
+    delta_ned_x = delta_map_y   # North = ENU_Y
+    delta_ned_y = delta_map_x   # East = ENU_X  
+    delta_ned_z = -delta_map_z  # Down = -ENU_Z
+    
+    # 현재 local 위치에 변위 적용
+    target_ned_x = current_local_pos.x + delta_ned_x
+    target_ned_y = current_local_pos.y + delta_ned_y
+    target_ned_z = current_local_pos.z + delta_ned_z
+    
+    return [float(target_ned_x), float(target_ned_y), float(target_ned_z)]
 
 
  

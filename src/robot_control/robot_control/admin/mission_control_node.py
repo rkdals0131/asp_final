@@ -175,6 +175,14 @@ class SimpleMissionControl(Node):
             self.get_logger().info(f"🚁 드론 상태: {self.drone_state} -> {msg.data}")
         self.drone_state = msg.data
 
+        # 드론이 Disarmed 상태가 되면 미션 완료 처리
+        if self.mission_state in ['PRECISION_LANDING', 'MISSION_COMPLETE'] and self.drone_state == 'DISARMED':
+            if self.mission_state != 'MISSION_COMPLETE':
+                self.mission_state = 'MISSION_COMPLETE'
+                self.mission_end_time = self.get_clock().now()
+                self.publish_mission_status()
+                self.get_logger().info("🎯 미션 완료! 드론 Disarmed 확인.")
+
     def vehicle_state_callback(self, msg: String):
         if self.ugv_state != msg.data:
             self.get_logger().info(f"🚗 UGV 상태: {self.ugv_state} -> {msg.data}")
@@ -262,12 +270,19 @@ class SimpleMissionControl(Node):
     def publish_mission_status(self):
         """미션 상태를 Dashboard에 발행 - ROS 시간 기반"""
         status_msg = String()
-        if self.mission_start_time:
+        elapsed_sec = 0.0
+
+        if self.mission_state == 'MISSION_COMPLETE' and self.mission_end_time:
+            # 미션 완료 시, 시작부터 종료까지의 시간으로 경과시간 고정
+            if self.mission_start_time:
+                elapsed_ns = (self.mission_end_time - self.mission_start_time).nanoseconds
+                elapsed_sec = elapsed_ns / 1e9
+        elif self.mission_start_time:
+            # 미션 진행 중, 현재 시간 기준으로 경과시간 계산
             elapsed_ns = (self.get_clock().now() - self.mission_start_time).nanoseconds
             elapsed_sec = elapsed_ns / 1e9
-            status_msg.data = f"{self.mission_state}|{elapsed_sec:.1f}"
-        else:
-            status_msg.data = f"{self.mission_state}|0.0"
+
+        status_msg.data = f"{self.mission_state}|{elapsed_sec:.1f}"
         self.mission_status_pub.publish(status_msg)
 
     def update_tf_poses(self):

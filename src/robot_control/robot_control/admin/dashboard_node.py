@@ -91,7 +91,13 @@ class UAVDashboard(Node):
         # --- 데이터 저장을 위한 멤버 변수 ---
         self.drone_local_pos = None     # GPS 기준점(ref) 및 속도 정보용
         self.vehicle_odom = None        # 차량 속도 정보용
-        self.marker_detections = None   # 마커 정보
+        self.detected_markers = {}      # 마커 ID별로 정보 저장: {id: {'pose': pose, 'stamp': stamp}}
+        for i in range(11):  # 0 to 10
+            self.detected_markers[i] = {
+                'pose': None,
+                'first_detection_time': None,  # 경과 시간 기록
+                'is_currently_detected': False
+            }
         self.drone_world_pos = None     # 드론 월드 위치 (TF)
         self.vehicle_world_pos = None   # 차량 월드 위치 (TF)
         self.drone_state = "INITIALIZING"
@@ -167,7 +173,22 @@ class UAVDashboard(Node):
         self.topic_last_seen['CAMERA_IMG'] = self.get_current_time_sec()
 
     def marker_detection_callback(self, msg: Detection3DArray):
-        self.marker_detections = msg
+        # 모든 마커를 '감지되지 않음'으로 초기화
+        for marker_id in self.detected_markers:
+            self.detected_markers[marker_id]['is_currently_detected'] = False
+            
+        for det in msg.detections:
+            if det.results:
+                try:
+                    marker_id = int(det.results[0].hypothesis.class_id)
+                    if marker_id in self.detected_markers:
+                        marker = self.detected_markers[marker_id]
+                        marker['pose'] = det.results[0].pose.pose
+                        marker['is_currently_detected'] = True
+                        if marker['first_detection_time'] is None:
+                            marker['first_detection_time'] = self.mission_elapsed_time
+                except (ValueError, IndexError):
+                    pass # 잘못된 마커 ID 형식은 무시
 
     def drone_state_callback(self, msg: String):
         self.drone_state = msg.data
@@ -318,24 +339,34 @@ class UAVDashboard(Node):
         print()
         
         # 시스템 상태 세부 정보 (왼쪽)
-        system_lines = [
-            f"  PX4: [{self.COLOR_GREEN}GO{self.COLOR_END}]" if px4_ok else f"  PX4: [{self.COLOR_RED}NO-GO{self.COLOR_END}]",
+        hw_status_lines = [
+            f"  PX4:     [{self.COLOR_GREEN}GO{self.COLOR_END}]" if px4_ok else f"  PX4:     [{self.COLOR_RED}NO-GO{self.COLOR_END}]",
             f"  UGV ODO: [{self.COLOR_GREEN}GO{self.COLOR_END}]" if vehicle_odom_ok else f"  UGV ODO: [{self.COLOR_RED}NO-GO{self.COLOR_END}]",
-            f"  CAM: [{self.COLOR_GREEN}GO{self.COLOR_END}]" if camera_ok else f"  CAM: [{self.COLOR_RED}NO-GO{self.COLOR_END}]",
-            f"  TF : [{self.COLOR_GREEN}GO{self.COLOR_END}]" if self.tf_status else f"  TF : [{self.COLOR_RED}NO-GO{self.COLOR_END}]",
-            ""  # 빈 줄
+            f"  CAM:     [{self.COLOR_GREEN}GO{self.COLOR_END}]" if camera_ok else f"  CAM:     [{self.COLOR_RED}NO-GO{self.COLOR_END}]",
+            f"  TF :     [{self.COLOR_GREEN}GO{self.COLOR_END}]" if self.tf_status else f"  TF :     [{self.COLOR_RED}NO-GO{self.COLOR_END}]"
         ]
-        
-        # 노드 상태 추가
+
+        sw_status_lines = []
+        node_display = {
+            'mission_admin': 'ADMIN', 
+            'path_follower': 'PATH',
+            'offboard_control': 'OFFBD'
+        }
         for node_name, status in self.node_status.items():
-            node_display = {
-                'mission_admin': 'ADMIN', 
-                'path_follower': 'PATH',
-                'offboard_control': 'OFFBD'
-            }
             display_name = node_display[node_name]
             status_str = f"[{self.COLOR_GREEN}GO{self.COLOR_END}]" if status else f"[{self.COLOR_RED}NO-GO{self.COLOR_END}]"
-            system_lines.append(f"  {display_name}: {status_str}")
+            sw_status_lines.append(f"{display_name}: {status_str}")
+
+        system_lines = []
+        max_sys_lines = max(len(hw_status_lines), len(sw_status_lines))
+        for i in range(max_sys_lines):
+            hw_part = hw_status_lines[i] if i < len(hw_status_lines) else ""
+            sw_part = sw_status_lines[i] if i < len(sw_status_lines) else ""
+            
+            hw_clean = re.sub(r'\x1b\[[0-9;]*m', '', hw_part)
+            hw_padded = hw_part + ' ' * (18 - len(hw_clean))
+            
+            system_lines.append(f"{hw_padded}{sw_part}")
         
         # 미션 정보 (오른쪽) - 단순히 받은 정보만 표시
         mission_lines = []
@@ -365,97 +396,134 @@ class UAVDashboard(Node):
         # 좌우로 나란히 출력
         for sys_line, mission_line in zip(system_lines, mission_lines):
             # ANSI 코드를 제외한 실제 텍스트 길이 계산
-            sys_clean = re.sub(r'\033\[[0-9;]*m', '', sys_line)
-            mission_clean = re.sub(r'\033\[[0-9;]*m', '', mission_line)
+            sys_clean = re.sub(r'\x1b\[[0-9;]*m', '', sys_line)
+            mission_clean = re.sub(r'\x1b\[[0-9;]*m', '', mission_line)
             
             # 왼쪽 컬럼을 35자로 맞춤
             sys_padded = sys_line + " " * (35 - len(sys_clean))
             print(f"{sys_padded}{mission_line}")
 
-        # === 섹션 3: 임무 정보 (Marker Detections) ==========================
-        print(f"\n{self.COLOR_BOLD}{'-'*70}\n{'MISSION PAYLOAD (MARKER DETECTIONS)':^70}\n{'-'*70}{self.COLOR_END}")
-        if self.marker_detections and self.drone_local_pos:
-            if not self.marker_detections.detections:
-                print(f"  {self.COLOR_YELLOW}Searching for markers...{self.COLOR_END}")
+        # === 섹션 3: 마커 감지 (Marker Detections) ==========================
+        print(f"\n{self.COLOR_BOLD}{'-'*70}\n{'Marker Detections':^70}\n{'-'*70}{self.COLOR_END}")
+
+        header = f"  {'ID':<4} | {'WORLD POS (m)':<25} | {'STATUS':<20} | {'FIRST SEEN':<10}"
+        print(self.COLOR_BOLD + header + self.COLOR_END)
+
+        sorted_marker_ids = sorted(self.detected_markers.keys())
+        for marker_id in sorted_marker_ids:
+            marker_info = self.detected_markers[marker_id]
+            pos = marker_info['pose']
+            first_detection_time = marker_info['first_detection_time']
+            is_detected = marker_info['is_currently_detected']
+
+            # World Position 문자열 포맷팅
+            pos_str = "(-, -, -)"
+            if pos:
+                pos_str = f"({pos.position.x:6.2f}, {pos.position.y:6.2f}, {pos.position.z:6.2f})"
+            
+            # Status 및 First Seen 문자열 포맷팅
+            status_str = ""
+            time_str = "N/A"
+            if is_detected:
+                status_str = f"{self.COLOR_GREEN}DETECTED{self.COLOR_END}"
+            elif first_detection_time is not None:
+                status_str = f"{self.COLOR_YELLOW}UNDETECTED{self.COLOR_END}"
             else:
-                ref_lat, ref_lon, ref_alt = self.drone_local_pos.ref_lat, self.drone_local_pos.ref_lon, self.drone_local_pos.ref_alt
-                
-                for det in self.marker_detections.detections:
-                    marker_id = det.results[0].hypothesis.class_id
-                    pos = det.results[0].pose.pose.position
-                    m_lat, m_lon, m_alt = self.enu_to_gps(pos.x, pos.y, pos.z, ref_lat, ref_lon, ref_alt)
-                    
-                    print(f"  {self.COLOR_BOLD}MARKER ID: {marker_id}{self.COLOR_END}")
-                    print(f"    - WORLD POS (m) : {self.COLOR_CYAN}X:{pos.x:6.2f} Y:{pos.y:6.2f} Z:{pos.z:6.2f}{self.COLOR_END}")
-                    if m_lat:
-                        print(f"    - GPS EST (Lat/Lon/Alt) : {self.COLOR_CYAN}{m_lat:.6f}, {m_lon:.6f}, {m_alt:.2f}{self.COLOR_END}")
-                    else:
-                        print(f"    - GPS EST         : {self.COLOR_YELLOW}Waiting for drone's GPS reference...{self.COLOR_END}")
-        else:
-            print(f"  {self.COLOR_YELLOW}Waiting for detection or GPS ref data...{self.COLOR_END}")
+                status_str = "NOT SEEN"
+
+            if first_detection_time is not None:
+                time_str = f"@{first_detection_time:.1f}s"
+            
+            # ANSI 코드를 제외한 실제 출력 길이 계산
+            status_clean_len = len(re.sub(r'\x1b\[[0-9;]*m', '', status_str))
+            
+            # 정렬을 위한 패딩 추가
+            pos_padded = f"{pos_str:<25}"
+            status_padded = f"{status_str}{' ' * (20 - status_clean_len)}"
+
+            line = f"  {marker_id:<4} | {pos_padded} | {status_padded} | {time_str:<10}"
+            print(line)
             
         # === 섹션 4: 플랫폼 원격측정 (Telemetry) =========================
         print(f"\n{self.COLOR_BOLD}{'-'*70}\n{'PLATFORM TELEMETRY':^70}\n{'-'*70}{self.COLOR_END}")
         
         # --- 드론 정보 ---
         print(f"  {self.COLOR_BOLD}DRONE ({self.drone_frame_id}){self.COLOR_END}")
-        print(self.format_data("STATE", self.drone_state))
+        
+        # Line 1: State and World Pos
+        state_str = f"(STATE: {self.COLOR_CYAN}{self.drone_state}{self.COLOR_END})"
+        pos_str = "(WORLD: Waiting for TF...)"
         if self.drone_world_pos:
             w_pos = self.drone_world_pos
-            print(self.format_data("WORLD POS (m)", f"X:{w_pos.x:6.2f} Y:{w_pos.y:6.2f} Z:{w_pos.z:6.2f}"))
-        else:
-            print(self.format_data("WORLD POS (m)", "Waiting for TF..."))
+            pos_str = f"(WORLD: {self.COLOR_CYAN}{w_pos.x:6.2f}, {w_pos.y:6.2f}, {w_pos.z:6.2f}m{self.COLOR_END})"
+        
+        state_clean = f"(STATE: {self.drone_state})"
+        state_padded = state_str + " " * (35 - len(state_clean))
+        print(f"  {state_padded}{pos_str}")
 
+        # Line 2: Velocity and GPS
+        vel_str = "(VEL: Waiting for PX4...)"
         if self.drone_local_pos:
-            d_vel = self.drone_local_pos.vx, self.drone_local_pos.vy, self.drone_local_pos.vz
-            print(self.format_data("VELOCITY (m/s)", f"X:{d_vel[0]:6.2f} Y:{d_vel[1]:6.2f} Z:{d_vel[2]:6.2f}"))
-
-            if self.drone_world_pos:
-                ref_lat, ref_lon, ref_alt = self.drone_local_pos.ref_lat, self.drone_local_pos.ref_lon, self.drone_local_pos.ref_alt
-                d_lat, d_lon, d_alt = self.enu_to_gps(self.drone_world_pos.x, self.drone_world_pos.y, self.drone_world_pos.z, ref_lat, ref_lon, ref_alt)
-                if d_lat:
-                    print(self.format_data("GPS (Lat/Lon/Alt)", f"{d_lat:.6f}, {d_lon:.6f}, {d_alt:.2f}"))
-                else:
-                    print(self.format_data("GPS (Lat/Lon/Alt)", "Waiting for GPS reference..."))
+            d_vel = self.drone_local_pos
+            vel_str = f"(VEL: {self.COLOR_CYAN}{d_vel.vx:5.1f}, {d_vel.vy:5.1f}, {d_vel.vz:5.1f}m/s{self.COLOR_END})"
+        
+        gps_str = "(GPS: N/A)"
+        if self.drone_world_pos and self.drone_local_pos and self.drone_local_pos.ref_lat != 0.0:
+            ref_lat, ref_lon, ref_alt = self.drone_local_pos.ref_lat, self.drone_local_pos.ref_lon, self.drone_local_pos.ref_alt
+            d_lat, d_lon, d_alt = self.enu_to_gps(self.drone_world_pos.x, self.drone_world_pos.y, self.drone_world_pos.z, ref_lat, ref_lon, ref_alt)
+            if d_lat:
+                gps_str = f"(GPS: {self.COLOR_CYAN}{d_lat:.6f}, {d_lon:.6f}, {d_alt:.2f}{self.COLOR_END})"
             else:
-                print(self.format_data("GPS (Lat/Lon/Alt)", "Waiting for World Pos..."))
-        else:
-            print(self.format_data("VELOCITY (m/s)", "Waiting for PX4..."))
-            print(self.format_data("GPS (Lat/Lon/Alt)", "Waiting for PX4..."))
+                gps_str = "(GPS: Waiting for ref...)"
 
+        vel_clean = "(VEL: Waiting for PX4...)"
+        if self.drone_local_pos:
+            d_vel = self.drone_local_pos
+            vel_clean = f"(VEL: {d_vel.vx:5.1f}, {d_vel.vy:5.1f}, {d_vel.vz:5.1f}m/s)"
+        vel_padded = vel_str + " " * (35 - len(vel_clean))
+        print(f"  {vel_padded}{gps_str}")
+        
         # --- 차량 정보 ---
         print(f"\n  {self.COLOR_BOLD}VEHICLE ({self.vehicle_frame_id}){self.COLOR_END}")
-        print(self.format_data("STATE", self.vehicle_state))
+        
+        # Line 1: State and World Pos
+        v_state_str = f"(STATE: {self.COLOR_CYAN}{self.vehicle_state}{self.COLOR_END})"
+        v_pos_str = "(WORLD: Waiting for TF...)"
         if self.vehicle_world_pos:
             vw_pos = self.vehicle_world_pos
-            print(self.format_data("WORLD POS (m)", f"X:{vw_pos.x:6.2f} Y:{vw_pos.y:6.2f} Z:{vw_pos.z:6.2f}"))
-        else:
-            print(self.format_data("WORLD POS (m)", "Waiting for TF..."))
-            
+            v_pos_str = f"(WORLD: {self.COLOR_CYAN}{vw_pos.x:6.2f}, {vw_pos.y:6.2f}, {vw_pos.z:6.2f}m{self.COLOR_END})"
+        
+        v_state_clean = f"(STATE: {self.vehicle_state})"
+        v_state_padded = v_state_str + " " * (35 - len(v_state_clean))
+        print(f"  {v_state_padded}{v_pos_str}")
+        
+        # Line 2: Velocity and GPS
+        v_vel_str = "(VEL: Waiting for Odom...)"
         if self.vehicle_odom:
             v_vel = self.vehicle_odom.twist.twist.linear
-            print(self.format_data("VELOCITY (m/s)", f"X:{v_vel.x:6.2f} Y:{v_vel.y:6.2f} Z:{v_vel.z:6.2f}"))
-        else:
-            print(self.format_data("VELOCITY (m/s)", "Waiting for Odom..."))
-        
-        if self.vehicle_world_pos and self.drone_local_pos:
+            v_vel_str = f"(VEL: {self.COLOR_CYAN}{v_vel.x:5.1f}, {v_vel.y:5.1f}, {v_vel.z:5.1f}m/s{self.COLOR_END})"
+
+        v_gps_str = "(GPS: N/A)"
+        if self.vehicle_world_pos and self.drone_local_pos and self.drone_local_pos.ref_lat != 0.0:
             ref_lat, ref_lon, ref_alt = self.drone_local_pos.ref_lat, self.drone_local_pos.ref_lon, self.drone_local_pos.ref_alt
             v_lat, v_lon, v_alt = self.enu_to_gps(self.vehicle_world_pos.x, self.vehicle_world_pos.y, self.vehicle_world_pos.z, ref_lat, ref_lon, ref_alt)
             if v_lat:
-                print(self.format_data("GPS (Lat/Lon/Alt)", f"{v_lat:.6f}, {v_lon:.6f}, {v_alt:.2f}"))
+                v_gps_str = f"(GPS: {self.COLOR_CYAN}{v_lat:.6f}, {v_lon:.6f}, {v_alt:.2f}{self.COLOR_END})"
             else:
-                print(self.format_data("GPS (Lat/Lon/Alt)", "Waiting for GPS reference..."))
-        else:
-            print(self.format_data("GPS (Lat/Lon/Alt)", "Waiting for World Pos or GPS ref..."))
+                v_gps_str = "(GPS: Waiting for ref...)"
+        
+        v_vel_clean = "(VEL: Waiting for Odom...)"
+        if self.vehicle_odom:
+            v_vel = self.vehicle_odom.twist.twist.linear
+            v_vel_clean = f"(VEL: {v_vel.x:5.1f}, {v_vel.y:5.1f}, {v_vel.z:5.1f}m/s)"
+        
+        v_vel_padded = v_vel_str + " " * (35 - len(v_vel_clean))
+        print(f"  {v_vel_padded}{v_gps_str}")
         
         # --- 하단 정보 ---
-        timestamp = datetime.datetime.fromtimestamp(self.get_clock().now().seconds_nanoseconds()[0]).strftime('%Y-%m-%d %H:%M:%S')
+        timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         print(f"\n{self.COLOR_BOLD}{'-'*70}{self.COLOR_END}")
         print(f"  Last updated: {timestamp}")
-        if mission_control_ok:
-            print(f"  {self.COLOR_GREEN}✅ Mission Control Connected{self.COLOR_END}")
-        else:
-            print(f"  {self.COLOR_RED}❌ Mission Control Disconnected{self.COLOR_END}")
 
 
 def main(args=None):

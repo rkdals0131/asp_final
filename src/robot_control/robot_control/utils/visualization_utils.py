@@ -71,7 +71,7 @@ def create_target_visual(node, target_id, position, color, text_label="", ns_pre
     sphere_pose.position = Point(x=position[0], y=position[1], z=position[2])
     sphere_pose.orientation.w = 1.0
     
-    sphere_scale = Vector3(x=3.0, y=3.0, z=1.0)  # 지름 2m 구
+    sphere_scale = Vector3(x=1.0, y=1.0, z=0.5)  # 지름 2m 구
     sphere_color = ColorRGBA(r=color[0], g=color[1], b=color[2], a=0.25)
     
     sphere_marker = create_marker(
@@ -86,7 +86,7 @@ def create_target_visual(node, target_id, position, color, text_label="", ns_pre
         text_pose.position = Point(x=position[0], y=position[1], z=position[2] - 1.0)  # 1m 아래
         text_pose.orientation.w = 1.0
         
-        text_scale = Vector3(x=0.0, y=0.0, z=0.8)  # 텍스트 크기
+        text_scale = Vector3(x=0.0, y=0.0, z=0.3)  # 텍스트 크기
         text_color = ColorRGBA(r=1.0, g=1.0, b=1.0, a=1.0)  # 흰색
         
         text_marker = create_marker(
@@ -146,7 +146,7 @@ def create_waypoint_visual(node, waypoint_id, position, waypoint_status="future"
         text_pose.position = Point(x=position[0], y=position[1], z=position[2] + 1.0)  # 1m 위
         text_pose.orientation.w = 1.0
         
-        text_scale = Vector3(x=0.0, y=0.0, z=0.6)  # 텍스트 크기
+        text_scale = Vector3(x=0.0, y=0.0, z=0.3)  # 텍스트 크기
         text_color = ColorRGBA(r=1.0, g=1.0, b=1.0, a=1.0)  # 흰색
         
         text_marker = create_marker(

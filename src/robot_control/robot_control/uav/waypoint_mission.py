@@ -37,7 +37,7 @@ class WaypointMissionNode(BaseMissionNode):
         
         # --- PX4 상태 구독자 ---
         self.land_detector_sub = self.create_subscription(
-            VehicleLandDetected, "/fmu/out/vehicle_land_detected", self._land_detected_callback, 10
+            VehicleLandDetected, "/fmu/out/vehicle_land_detected", self._land_detected_callback, self.qos_profile
         )
         
         # --- 미션 컨트롤 서비스 클라이언트 ---
@@ -45,7 +45,6 @@ class WaypointMissionNode(BaseMissionNode):
         
         # --- 웨이포인트 미션 관련 변수 ---
         self.current_waypoint_index = 0
-        self.hover_start_time = None
         
         # 짐벌 카메라 프레임 ID 파라미터로 로드 (config에서 받아옴)
         self.declare_parameter('gimbal_camera_frame', 'x500_gimbal_0/camera_link')
@@ -90,11 +89,13 @@ class WaypointMissionNode(BaseMissionNode):
         self.get_logger().info(f"🎯 착륙 마커 ID: {self.landing_marker_id}, 착륙 고도: {self.landing_altitude}m")
     
     def _land_detected_callback(self, msg: VehicleLandDetected):
-        """PX4의 착륙 상태를 감지하는 콜백"""
-        # PRECISION_LANDING 또는 LANDING 상태이고, PX4가 착륙을 감지했으며, 아직 미션 완료 전일 때
-        if self.state in ["PRECISION_LANDING", "LANDING"] and msg.landed and self.state != "MISSION_COMPLETE":
-            self.get_logger().info("✅ PX4 컨트롤러가 착륙 완료를 감지했습니다.")
-            self.on_mission_complete()
+        """PX4의 착륙 상태를 감지하는 콜백 (보조용)"""
+        # 이 콜백은 이제 주 착륙 감지 메커니즘이 아닙니다.
+        # check_landed_on_vehicle()가 주된 역할을 합니다.
+        if msg.landed and self.state == "LANDING":
+             self.get_logger().info("✅ (보조 감지) PX4 컨트롤러가 착륙을 보고했습니다.")
+             # 즉시 상태를 변경하지 않고, check_landed_on_vehicle에 의해 처리되도록 둡니다.
+             pass
 
     def _marker_detection_callback(self, msg: Detection3DArray):
         """마커 탐지 토픽 콜백 함수"""
@@ -231,15 +232,14 @@ class WaypointMissionNode(BaseMissionNode):
             self._handle_takeoff_state()
         elif self.state == "MOVING_TO_WAYPOINT":
             self._handle_moving_to_waypoint_state()
-        elif self.state == "HOVERING_AT_WAYPOINT":
-            self._handle_hovering_at_waypoint_state()
         elif self.state == "AWAITING_LANDING_COMMAND":
             self._handle_awaiting_landing_command_state()
         elif self.state == "PRECISION_LANDING":
             self._handle_precision_landing_state()
         elif self.state == "LANDING":
-            # LANDING 상태에서는 PX4가 착륙을 완료할 때까지 대기
-            self.get_logger().info("🛬 PX4 자동 착륙 진행 중... 지상 감지 대기", throttle_duration_sec=5.0)
+            # LANDING 상태에서는 UGV 위 착륙을 감지할 때까지 대기
+            self.get_logger().info("🛬 UGV 위 착륙 감지 확인 중...", throttle_duration_sec=2.0)
+            self.check_landed_on_vehicle()
     
     def _handle_takeoff_state(self):
         """이륙 상태 처리"""
@@ -260,9 +260,11 @@ class WaypointMissionNode(BaseMissionNode):
         self.get_logger().info("⏳ 최종 지점에서 호버링하며 착륙 명령 대기 중...", throttle_duration_sec=10.0)
     
     def _handle_moving_to_waypoint_state(self):
-        """웨이포인트로 이동 상태 처리"""
+        """웨이포인트로 이동 상태 처리 (호버링 없음)"""
         if self.current_waypoint_index >= len(self.drone_waypoints):
-            self.state = "LANDING"
+            self.get_logger().info("🏁 모든 웨이포인트 방문 완료. 최종 지점에서 착륙 명령 대기.")
+            self.state = "AWAITING_LANDING_COMMAND"
+            self.send_mission_complete(4)  # DRONE_APPROACH_COMPLETE
             return
 
         target_wp = self.drone_waypoints[self.current_waypoint_index]
@@ -276,41 +278,18 @@ class WaypointMissionNode(BaseMissionNode):
         self.point_gimbal_at_target(target_stare_pos)
 
         # 도착 확인
-        if self.check_arrival(target_wp.tolist()):
-            self.get_logger().info(f"웨이포인트 {self.current_waypoint_index} 도착. 2초간 호버링.")
-            self.state = "HOVERING_AT_WAYPOINT"
-            self.hover_start_time = self.get_clock().now()
-    
-    def _handle_hovering_at_waypoint_state(self):
-        """웨이포인트에서 호버링 상태 처리"""
-        if self.hover_start_time is None:
-            self.state = "MOVING_TO_WAYPOINT"
-            return
-
-        target_wp = self.drone_waypoints[self.current_waypoint_index]
-        target_stare_idx = self.stare_indices[self.current_waypoint_index]
-        target_stare_pos = self.stare_targets[target_stare_idx]
-        
-        # 현재 위치 유지 (위치 + yaw 제어)
-        self.publish_waypoint_setpoint(self.current_waypoint_index)
-        
-        # 주시 타겟 계속 응시
-        self.point_gimbal_at_target(target_stare_pos)
-        
-        # 2초 호버링 완료 확인
-        if self.get_clock().now() - self.hover_start_time > rclpy.duration.Duration(seconds=2):
+        if self.check_arrival(target_wp.tolist(), tolerance=3.5):
+            self.get_logger().info(f"웨이포인트 {self.current_waypoint_index} 통과.")
             self.current_waypoint_index += 1
-            
+
+            # 마지막 웨이포인트였는지 확인
             if self.current_waypoint_index >= len(self.drone_waypoints):
                 self.get_logger().info("🏁 모든 웨이포인트 방문 완료. 최종 지점에서 착륙 명령 대기.")
                 self.state = "AWAITING_LANDING_COMMAND"
-                # 미션 컨트롤에 랑데부 지점 도착 신호 전송
                 self.send_mission_complete(4)  # DRONE_APPROACH_COMPLETE
             else:
-                self.get_logger().info(f"호버링 완료. 다음 웨이포인트로 이동: {self.current_waypoint_index}")
-                self.state = "MOVING_TO_WAYPOINT"
-            
-            self.hover_start_time = None
+                # 다음 웨이포인트로 계속 진행 (상태는 MOVING_TO_WAYPOINT 유지)
+                self.get_logger().info(f"다음 웨이포인트로 이동: {self.current_waypoint_index}")
     
     def _handle_awaiting_landing_command_state(self):
         """착륙 명령 대기 상태 처리"""
@@ -363,8 +342,8 @@ class WaypointMissionNode(BaseMissionNode):
         h_error = math.sqrt((marker_world_pos.x - current_pos.x)**2 + (marker_world_pos.y - current_pos.y)**2)
         relative_altitude = current_pos.z - marker_world_pos.z
 
-        # 최종 착륙 조건: 마커와의 상대 고도가 3m 미만이고, 수평 오차가 허용치 이내일 때
-        if relative_altitude < 3.0 and h_error < self.precision_horizontal_tolerance:
+        # 최종 착륙 조건: 마커와의 상대 고도가 1m 미만이고, 수평 오차가 허용치 이내일 때
+        if relative_altitude < 1.0 and h_error < self.precision_horizontal_tolerance:
             self.get_logger().info(f"🛬 최종 착륙 조건 만족 (상대고도: {relative_altitude:.2f}m, 수평오차: {h_error:.2f}m). PX4 자동 착륙 시작.")
             dcu.land_drone(self)
             self.land_command_issued = True # land 명령 중복 전송 방지
