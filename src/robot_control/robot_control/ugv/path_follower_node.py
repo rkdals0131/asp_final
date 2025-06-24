@@ -6,7 +6,7 @@ from rclpy.qos import QoSProfile, DurabilityPolicy
 from geometry_msgs.msg import Twist, Pose, PoseStamped
 from nav_msgs.msg import Path, Odometry
 from visualization_msgs.msg import Marker, MarkerArray
-from std_msgs.msg import String
+from std_msgs.msg import String, Header
 from mission_admin_interfaces.srv import MissionComplete
 
 import tf2_ros
@@ -22,6 +22,7 @@ from robot_control.utils.waypoint_parser import load_waypoints_from_csv, Waypoin
 from robot_control.ugv.path_planner import PathPlanner
 from robot_control.ugv.velocity_profiler import VelocityProfiler
 from robot_control.ugv.pure_pursuit import PurePursuitController
+from robot_control.utils import viz_factory
 
 class PathFollowerNode(Node):
     """
@@ -336,79 +337,34 @@ class PathFollowerNode(Node):
         return False
 
     def _publish_path_visualization(self):
+        """viz_factory를 사용하여 경로 관련 시각화 데이터를 생성하고 발행."""
         if not self.full_path_points: return
-        path_msg = Path()
-        path_msg.header.frame_id = self.MAP_FRAME
-        path_msg.header.stamp = self.get_clock().now().to_msg()
-        for point in self.full_path_points:
-            pose_stamped = PoseStamped()
-            pose_stamped.header = path_msg.header
-            pose = Pose()
-            pose.position.x, pose.position.y, pose.orientation.w = point[0], point[1], 1.0
-            pose_stamped.pose = pose
-            path_msg.poses.append(pose_stamped)
+
+        header = Header()
+        header.stamp = self.get_clock().now().to_msg()
+        header.frame_id = self.MAP_FRAME
+
+        # 1. Path 메시지 생성 및 발행
+        path_msg = viz_factory.create_ugv_path_marker(header, self.full_path_points)
         self.path_pub.publish(path_msg)
-        self._publish_waypoint_markers()
-        self._publish_speed_markers()
 
-    def _publish_waypoint_markers(self):
-        marker_array = MarkerArray()
-        for i, waypoint in enumerate(self.raw_waypoints):
-            x, y = waypoint[0], waypoint[1]
-            marker = Marker()
-            marker.header.frame_id = self.MAP_FRAME
-            marker.ns, marker.id, marker.type, marker.action = "waypoints", i, Marker.SPHERE, Marker.ADD
-            marker.pose.position.x, marker.pose.position.y, marker.pose.position.z = float(x), float(y), 0.5
-            marker.pose.orientation.w = 1.0
-            marker.scale.x = marker.scale.y = marker.scale.z = 1.5
-            if len(waypoint) > 2:
-                if waypoint[2] == 2: marker.color.r, marker.color.g, marker.color.b = 1.0, 1.0, 0.0
-                elif waypoint[2] == 4: marker.color.r, marker.color.g, marker.color.b = 1.0, 0.0, 0.0
-                else: marker.color.r, marker.color.g, marker.color.b = 0.0, 0.0, 1.0
-            else: marker.color.r, marker.color.g, marker.color.b = 0.0, 0.0, 1.0
-            if len(waypoint) > 3 and 0 < waypoint[3] <= 1.0:
-                marker.color.r, marker.color.g, marker.color.b = 1.0, 0.5, 0.0
-            marker.color.a = 0.8
-            marker_array.markers.append(marker)
-        self.waypoint_marker_pub.publish(marker_array)
+        # 2. 웨이포인트 마커 생성 및 발행
+        waypoint_markers = viz_factory.create_ugv_waypoint_markers(header, self.raw_waypoints)
+        self.waypoint_marker_pub.publish(waypoint_markers)
 
-    def _publish_speed_markers(self):
-        marker_array = MarkerArray()
-        step = max(1, int(0.5 / self.PATH_DENSITY))
-        delete_marker = Marker()
-        delete_marker.action = Marker.DELETEALL
-        marker_array.markers.append(delete_marker)
-        self.speed_marker_pub.publish(marker_array)
-        marker_array.markers.clear()
-        for i in range(0, len(self.full_path_points), step):
-            if i >= len(self.full_target_velocities): break
-            point, vel = self.full_path_points[i], self.full_target_velocities[i]
-            cyl_height = max(0.2, float(vel * 0.5))
-            cylinder = Marker()
-            cylinder.header.frame_id, cylinder.ns, cylinder.id, cylinder.type, cylinder.action = self.MAP_FRAME, "speed_cylinders", i, Marker.CYLINDER, Marker.ADD
-            cylinder.pose.position.x, cylinder.pose.position.y, cylinder.pose.position.z = point[0], point[1], cyl_height / 2.0
-            cylinder.pose.orientation.w = 1.0
-            cylinder.scale.x = cylinder.scale.y = 0.15
-            cylinder.scale.z = cyl_height
-            if vel <= 1.0: cylinder.color.r, cylinder.color.g, cylinder.color.b = 0.0, 0.5, 1.0
-            elif vel <= self.MAX_SPEED * 0.6: cylinder.color.r, cylinder.color.g, cylinder.color.b = 0.0, 1.0, 0.0
-            else: cylinder.color.r, cylinder.color.g, cylinder.color.b = 1.0, 0.0, 0.0
-            cylinder.color.a = 0.6
-            marker_array.markers.append(cylinder)
-            text = Marker()
-            text.header.frame_id, text.ns, text.id, text.type, text.action = self.MAP_FRAME, "speed_text", i, Marker.TEXT_VIEW_FACING, Marker.ADD
-            text.pose.position.x, text.pose.position.y, text.pose.position.z = point[0], point[1], cyl_height + 0.3
-            text.pose.orientation.w, text.text, text.scale.z = 1.0, f"{vel:.1f}", 0.3
-            text.color.r = text.color.g = text.color.b = text.color.a = 1.0
-            marker_array.markers.append(text)
-        self.speed_marker_pub.publish(marker_array)
+        # 3. 속도 마커 생성 및 발행
+        speed_markers = viz_factory.create_speed_markers(
+            header, self.full_path_points, self.full_target_velocities, self.PATH_DENSITY, self.MAX_SPEED
+        )
+        self.speed_marker_pub.publish(speed_markers)
 
     def _publish_lookahead_marker(self, goal_point):
-        marker = Marker()
-        marker.header.frame_id, marker.ns, marker.id, marker.type, marker.action = self.MAP_FRAME, "lookahead", 0, Marker.SPHERE, Marker.ADD
-        marker.pose.position.x, marker.pose.position.y, marker.pose.position.z = goal_point[0], goal_point[1], 0.5
-        marker.pose.orientation.w, marker.scale.x, marker.scale.y, marker.scale.z = 1.0, 1.0, 1.0, 1.0
-        marker.color.r, marker.color.g, marker.color.b, marker.color.a = 0.0, 1.0, 0.0, 0.8
+        """viz_factory를 사용하여 Lookahead 마커를 생성하고 발행."""
+        header = Header()
+        header.stamp = self.get_clock().now().to_msg()
+        header.frame_id = self.MAP_FRAME
+        
+        marker = viz_factory.create_lookahead_marker(header, goal_point)
         self.lookahead_marker_pub.publish(marker)
 
     def _load_waypoints(self):

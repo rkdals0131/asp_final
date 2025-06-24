@@ -9,15 +9,16 @@ import threading
 import sys
 import math
 
-from std_msgs.msg import String
+from std_msgs.msg import String, Header
 from vision_msgs.msg import Detection3DArray
+from visualization_msgs.msg import Marker, MarkerArray
 from px4_msgs.msg import VehicleLandDetected  # 착륙 감지 메시지
 from mission_admin_interfaces.srv import MissionComplete
 from rcl_interfaces.msg import ParameterDescriptor
 
 from .base_mission_node import BaseMissionNode
 from ..utils import drone_control_utils as dcu
-from ..utils import visualization_utils as visu
+from ..utils import viz_factory as visu
 
 
 class WaypointMissionNode(BaseMissionNode):
@@ -86,7 +87,7 @@ class WaypointMissionNode(BaseMissionNode):
         
         self.get_logger().info("웨이포인트 미션 및 정밀 착륙 컨트롤러가 초기화되었음")
         self.get_logger().info(f"총 {len(self.drone_waypoints)}개의 웨이포인트가 설정되었음")
-        self.get_logger().info(f"🎯 착륙 마커 ID: {self.landing_marker_id}, 착륙 고도: {self.landing_altitude}m")
+        self.get_logger().info(f"착륙 마커 ID: {self.landing_marker_id}, 착륙 고도: {self.landing_altitude}m")
     
     def _land_detected_callback(self, msg: VehicleLandDetected):
         """PX4의 착륙 상태를 감지하는 콜백 (보조용)"""
@@ -204,14 +205,66 @@ class WaypointMissionNode(BaseMissionNode):
     
     # 시각화
     
+    def _create_header(self, frame_id: str) -> Header:
+        """지정된 frame_id로 ROS 메시지 헤더를 생성합니다."""
+        header = Header()
+        header.stamp = self.get_clock().now().to_msg()
+        header.frame_id = frame_id
+        return header
+
     def _publish_mission_visuals(self):
-        """RViz 시각화를 위한 모든 마커(경로, 타겟, 짐벌 방향)를 생성하고 게시합니다."""
-        marker_array = visu.create_mission_visual_markers(
-            self, 
-            self.drone_waypoints.tolist(), 
-            self.stare_targets,
-            self.current_waypoint_index
-        )
+        """RViz 시각화를 위한 미션 경로, 웨이포인트, 응시 지점 마커를 게시합니다."""
+        marker_array = MarkerArray()
+
+        # 0. 이전 마커 모두 삭제 (DELETEALL 액션)
+        delete_marker = Marker(action=Marker.DELETEALL)
+        marker_array.markers.append(delete_marker)
+
+        # 1. 미션 경로 시각화
+        waypoints = self.drone_waypoints.tolist()
+        if len(waypoints) > 1:
+            path_header = self._create_header("map")
+            path_marker = visu.create_mission_path_marker(
+                header=path_header,
+                waypoints=waypoints
+            )
+            marker_array.markers.append(path_marker)
+
+        # 2. 웨이포인트 시각화
+        for i, wp in enumerate(waypoints):
+            # 웨이포인트 상태 결정
+            if i < self.current_waypoint_index:
+                status = "passed"
+            elif i == self.current_waypoint_index:
+                status = "current"
+            else:
+                status = "future"
+
+            wp_header = self._create_header("map")
+            waypoint_markers = visu.create_waypoint_visual(
+                header=wp_header,
+                waypoint_id=i,
+                position=wp,
+                waypoint_status=status,
+                text_label=f"WP {i}"
+            )
+            marker_array.markers.extend(waypoint_markers)
+
+        # 3. 응시 지점(Stare Target) 시각화
+        for i, target in enumerate(self.stare_targets):
+            target_header = self._create_header("map")
+            # 현재 웨이포인트에 해당하는 타겟만 강조
+            color = (1.0, 0.0, 0.0) if i == self.current_waypoint_index else (1.0, 0.5, 0.0)
+            
+            target_markers = visu.create_target_visual(
+                header=target_header,
+                target_id=i,
+                position=target,
+                color=color,
+                text_label=f"Target {i}"
+            )
+            marker_array.markers.extend(target_markers)
+            
         self.visual_marker_publisher.publish(marker_array)
     
     # 미션 로직 구현 (BaseMissionNode의 추상 메서드)
@@ -313,7 +366,7 @@ class WaypointMissionNode(BaseMissionNode):
         # 첫 진입 시 짐벌을 아래로 향하게 설정
         if self.precision_landing_start_altitude is not None:
             dcu.point_gimbal_down(self)
-            self.get_logger().info("🎯 정밀 착륙 모드 시작 - 짐벌을 아래로 향하게 설정")
+            self.get_logger().info("정밀 착륙 모드 시작 - 짐벌을 아래로 향하게 설정")
             self.precision_landing_start_altitude = None  # 한 번만 실행
 
         # 마커 탐지 여부 확인 (2초 이내)
@@ -323,7 +376,7 @@ class WaypointMissionNode(BaseMissionNode):
 
         if not marker_detected:
             # 마커 미탐지: 마지막 웨이포인트 위치에서 하강하며 탐색
-            self.get_logger().info(f"🔍 마커를 찾을 수 없습니다. 고도를 낮추며 탐색합니다. (속도: {self.search_descent_speed} m/s)",
+            self.get_logger().info(f"마커를 찾을 수 없습니다. 고도를 낮추며 탐색합니다. (속도: {self.search_descent_speed} m/s)",
                                  throttle_duration_sec=2.0)
 
             target_pos = [
@@ -343,7 +396,7 @@ class WaypointMissionNode(BaseMissionNode):
 
         # 최종 착륙 조건: 마커와의 상대 고도가 1m 미만이고, 수평 오차가 허용치 이내일 때
         if relative_altitude < 1.0 and h_error < self.precision_horizontal_tolerance:
-            self.get_logger().info(f"🛬 최종 착륙 조건 만족 (상대고도: {relative_altitude:.2f}m, 수평오차: {h_error:.2f}m). PX4 자동 착륙 시작.")
+            self.get_logger().info(f"최종 착륙 조건 만족 (상대고도: {relative_altitude:.2f}m, 수평오차: {h_error:.2f}m). PX4 자동 착륙 시작.")
             dcu.land_drone(self)
             self.land_command_issued = True # land 명령 중복 전송 방지
             self.state = "LANDING" # 상태를 LANDING으로 변경
@@ -354,7 +407,7 @@ class WaypointMissionNode(BaseMissionNode):
         target_pos = [marker_world_pos.x, marker_world_pos.y, target_altitude]
 
         self.publish_position_setpoint(target_pos)
-        self.get_logger().info(f"🎯 마커 정렬 및 하강 - 상대고도: {relative_altitude:.2f}m, 수평오차: {h_error:.3f}m",
+        self.get_logger().info(f"마커 정렬 및 하강 - 상대고도: {relative_altitude:.2f}m, 수평오차: {h_error:.3f}m",
                              throttle_duration_sec=1.0)
     
     # --- 오버라이드 메서드 ---
@@ -365,7 +418,7 @@ class WaypointMissionNode(BaseMissionNode):
             return # 중복 호출 방지
             
         super().on_mission_complete()
-        self.get_logger().info("🎯 웨이포인트 미션이 성공적으로 완료되었습니다!")
+        self.get_logger().info("웨이포인트 미션이 성공적으로 완료되었습니다!")
         self.send_mission_complete(5) # DRONE_HOVER_COMPLETE (미션 완료 신호)
 
 

@@ -254,7 +254,7 @@ class WaypointMissionNode(BaseMissionNode):
     def on_mission_complete(self):
         """미션 완료 시 추가 처리"""
         super().on_mission_complete()
-        self.get_logger().info("🎯 웨이포인트 미션이 성공적으로 완료되었습니다!")
+        self.get_logger().info("웨이포인트 미션이 성공적으로 완료되었습니다!")
 
 
 def main(args=None):

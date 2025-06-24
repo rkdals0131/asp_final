@@ -10,20 +10,18 @@ def generate_launch_description():
     # 패키지 디렉토리 찾기
     pkg_share = FindPackageShare('robot_control')
     
-    # 파일 경로 구성
-    csv_file_path = PathJoinSubstitution([
-        pkg_share,
-        'config',
-        'ugv_wp.csv'
+    # --- 파일 경로 구성 ---
+    ugv_wp_csv = PathJoinSubstitution([
+        pkg_share, 'config', 'ugv_wp.csv'
     ])
-    
-    params_file_path = PathJoinSubstitution([
-        pkg_share,
-        'config',
-        'ugv_params.yaml'
+    ugv_params = PathJoinSubstitution([
+        pkg_share, 'config', 'ugv_params.yaml'
     ])
+
     
-    # Path Follower Node
+    # --- 노드 정의 ---
+    
+    # 1. Path Follower Node
     path_follower_node = Node(
         package='robot_control',
         executable='path_follower_node',
@@ -31,10 +29,8 @@ def generate_launch_description():
         output='screen',
         emulate_tty=True,
         parameters=[
-            params_file_path,
-            {
-                'waypoint_file': csv_file_path,
-            }
+            ugv_params,
+            {'waypoint_file': ugv_wp_csv},
         ]
     )
     

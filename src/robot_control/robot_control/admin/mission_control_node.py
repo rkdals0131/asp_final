@@ -9,8 +9,9 @@ from rcl_interfaces.msg import ParameterDescriptor
 # 메시지 타입 임포트
 from px4_msgs.msg import VehicleLocalPosition, VehicleAttitude, TakeoffStatus
 from nav_msgs.msg import Odometry
-from std_msgs.msg import String
+from std_msgs.msg import String, Header
 from mission_admin_interfaces.srv import MissionComplete
+from visualization_msgs.msg import MarkerArray
 
 # TF2 관련 임포트
 from tf2_ros import TransformException
@@ -24,6 +25,9 @@ import threading
 import signal
 import sys
 from typing import Optional, Dict, List
+
+# 리팩터링된 viz_factory 임포트
+from robot_control.utils import viz_factory
 
 class SimpleMissionControl(Node):
     """
@@ -45,6 +49,9 @@ class SimpleMissionControl(Node):
             ParameterDescriptor(description="차량 TF 프레임 ID"))
         self.declare_parameter('map_frame', 'map',
             ParameterDescriptor(description="맵 TF 프레임 ID"))
+        # Ground Truth CSV 파일 경로 파라미터 추가
+        self.declare_parameter('ground_truth_csv_path', 'config/aruco_markers.csv',
+            ParameterDescriptor(description="Ground Truth 마커 CSV 파일 경로"))
 
         # 파라미터 값 로드
         self.check_timeout = self.get_parameter('check_timeout').value
@@ -138,6 +145,9 @@ class SimpleMissionControl(Node):
         # 미션 상태 퍼블리셔 (Dashboard용)
         self.mission_status_pub = self.create_publisher(String, '/mission/status', 10)
 
+        # Ground-Truth 마커 발행 로직 추가
+        self._publish_ground_truth_markers()
+
         # 데이터 업데이트 타이머
         self.timer = self.create_timer(1.0 / 10.0, self.update_data)  # 10Hz
         self.status_timer = self.create_timer(5.0, self.print_status)  # 5초마다 간단한 상태 출력
@@ -152,6 +162,35 @@ class SimpleMissionControl(Node):
         self.get_logger().info("=== Simple Mission Control Dashboard v4.0 ===")
         self.get_logger().info("ROS 시간 기반, 최적화된 통신 구조")
         self.get_logger().info("명령어: 's'=시작, 'a'=중단, 'r'=리셋, 'q'=종료")
+
+    def _publish_ground_truth_markers(self):
+        """
+        노드 초기화 시 viz_factory를 호출하여 Ground Truth 마커를
+        Latched 토픽으로 한 번만 발행.
+        """
+        gt_csv_path = self.get_parameter('ground_truth_csv_path').get_parameter_value().string_value
+        
+        # 패키지 루트를 기준으로 절대 경로 생성
+        if not os.path.isabs(gt_csv_path):
+            package_dir = os.path.join(os.path.dirname(__file__), '..', '..')
+            gt_csv_path = os.path.join(package_dir, gt_csv_path)
+
+        header = Header()
+        header.stamp = self.get_clock().now().to_msg()
+        header.frame_id = self.map_frame
+        
+        # viz_factory의 고수준 함수 호출
+        marker_array, info_msg = viz_factory.create_ground_truth_markers_from_csv(header, gt_csv_path)
+
+        if not marker_array.markers:
+            self.get_logger().error(info_msg) # 실패 시 info_msg는 에러 메시지
+            return
+
+        latched_qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        gt_marker_pub = self.create_publisher(MarkerArray, '/ground_truth_markers', latched_qos)
+        
+        gt_marker_pub.publish(marker_array)
+        self.get_logger().info(info_msg) # 성공 시 info_msg는 로드 정보
 
     def signal_handler(self, signum, frame):
         """Ctrl+C 핸들러"""
