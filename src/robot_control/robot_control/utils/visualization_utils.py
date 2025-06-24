@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 RViz 시각화 관련 유틸리티 함수 모음
-마커 생성, 웨이포인트 시각화, 경로 표시 등의 기능을 제공합니다.
+마커 생성, 웨이포인트 시각화, 경로 표시 등의 기능을 제공
 """
 
 import rclpy
@@ -12,7 +12,7 @@ from geometry_msgs.msg import Point, Pose, Vector3
 
 def create_marker(node, frame_id, ns, marker_id, marker_type, pose, scale, color, text="", lifetime_sec=1.1):
     """
-    RViz 시각화를 위한 기본 마커를 생성합니다.
+    RViz 시각화를 위한 기본 마커를 생성
     
     Args:
         node: ROS2 노드 인스턴스
@@ -51,7 +51,7 @@ def create_marker(node, frame_id, ns, marker_id, marker_type, pose, scale, color
 
 def create_target_visual(node, target_id, position, color, text_label="", ns_prefix="target"):
     """
-    하나의 타겟을 나타내는 시각적 요소(구, 텍스트)들을 생성합니다.
+    하나의 타겟을 나타내는 시각적 요소(구, 텍스트)들을 생성
     
     Args:
         node: ROS2 노드 인스턴스
@@ -100,7 +100,7 @@ def create_target_visual(node, target_id, position, color, text_label="", ns_pre
 
 def create_waypoint_visual(node, waypoint_id, position, waypoint_status="future", text_label="", ns_prefix="waypoint"):
     """
-    하나의 웨이포인트를 나타내는 단순한 큐브 마커를 생성합니다.
+    하나의 웨이포인트를 나타내는 단순한 큐브 마커를 생성
     
     Args:
         node: ROS2 노드 인스턴스
@@ -160,7 +160,7 @@ def create_waypoint_visual(node, waypoint_id, position, waypoint_status="future"
 
 def create_path_marker(node, waypoints, color=(0.1, 1.0, 0.1), ns="path", marker_id=0, alpha=1.0):
     """
-    웨이포인트들을 연결하는 경로 마커를 생성합니다.
+    웨이포인트들을 연결하는 경로 마커를 생성
     
     Args:
         node: ROS2 노드 인스턴스
@@ -194,7 +194,7 @@ def create_path_marker(node, waypoints, color=(0.1, 1.0, 0.1), ns="path", marker
 
 def create_mission_visual_markers(node, waypoints, stare_targets=None, current_waypoint_idx=0):
     """
-    미션 전체의 시각화 마커들을 생성합니다.
+    미션 전체의 시각화 마커들을 생성
     
     Args:
         node: ROS2 노드 인스턴스
@@ -246,7 +246,7 @@ def create_mission_visual_markers(node, waypoints, stare_targets=None, current_w
 
 def create_interactive_mission_markers(node, drone_waypoints, stare_targets, final_destination=None):
     """
-    대화형 미션용 드론 웨이포인트와 주시 타겟 마커들을 생성합니다.
+    대화형 미션용 드론 웨이포인트와 주시 타겟 마커들을 생성
     
     Args:
         node: ROS2 노드 인스턴스

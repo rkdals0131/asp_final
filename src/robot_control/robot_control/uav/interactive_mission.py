@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 사용자 대화형 드론 미션 노드
-사용자 입력에 따라 드론을 제어하는 오프보드 제어 노드입니다.
-- 이륙, 착륙, 정지, 재시동, 지점 이동, 고도 및 짐벌 변경, 특정 지점 응시(stare) 기능을 수행합니다.
+사용자 입력에 따라 드론을 제어하는 오프보드 제어 노드
+- 이륙, 착륙, 정지, 재시동, 지점 이동, 고도 및 짐벌 변경, 특정 지점 응시(stare) 기능을 수행
 """
 import rclpy
 import threading
@@ -21,13 +21,13 @@ from ..utils import visualization_utils as visu
 class InteractiveMissionNode(BaseMissionNode):
     """
     사용자 대화형 미션을 수행하는 노드.
-    터미널 입력을 통해 드론을 실시간으로 제어할 수 있습니다.
+    터미널 입력을 통해 드론을 실시간으로 제어할 수 있음
     """
     
     def __init__(self):
         super().__init__('interactive_mission_node', drone_frame_id="x500_gimbal_0")
         
-        # --- 추가 서브스크라이버 (대화형 미션 전용) ---
+        # 추가 서브스크라이버 (대화형 미션 전용)
         self.land_detected_subscriber = self.create_subscription(
             VehicleLandDetected, "/fmu/out/vehicle_land_detected",
             self.land_detected_callback, self.qos_profile
@@ -37,30 +37,30 @@ class InteractiveMissionNode(BaseMissionNode):
             self.gimbal_status_callback, self.qos_profile
         )
         
-        # --- 미션별 상태 변수 ---
+        # 미션별 상태 변수
         self.land_detected = None
         self.target_pose_map = PoseStamped()
         self.target_pose_map.header.frame_id = 'map'
         self.takeoff_altitude = 10.0
         self.takeoff_target_local = None
         
-        # --- Stare 기능을 위한 상태 변수 ---
+        # Stare 기능을 위한 상태 변수
         self.stare_target_index = None
         
-        # --- Head 기능을 위한 상태 변수 ---
+        # Head 기능을 위한 상태 변수
         self.target_yaw_deg = None
         
-        # --- 사용자 입력을 위한 스레드 ---
+        # 사용자 입력을 위한 스레드
         self.input_thread = threading.Thread(target=self.command_input_loop)
         self.input_thread.daemon = True
         self.input_thread.start()
         
-        self.get_logger().info("🎮 대화형 미션 컨트롤러가 실행 중입니다.")
+        self.get_logger().info("대화형 미션 컨트롤러가 실행 중")
         self.get_logger().info(f"📍 드론 웨이포인트: {len(self.drone_waypoints)}개, 주시 타겟: {len(self.stare_targets)}개")
         self.get_logger().info("TF 및 Local Position 데이터를 기다리는 중...")
         self.get_logger().info("💡 'start' 또는 'arm' 명령으로 드론을 시동하세요.")
     
-    # --- 추가 콜백 함수들 ---
+    # 추가 콜백 함수들
     
     def land_detected_callback(self, msg: VehicleLandDetected):
         """착륙 감지 콜백"""
@@ -80,11 +80,11 @@ class InteractiveMissionNode(BaseMissionNode):
             throttle_duration_sec=1
         )
     
-    # --- 사용자 입력 처리 ---
+    # 사용자 입력 처리
     
     def command_input_loop(self):
         """사용자 명령을 터미널에서 입력받는 루프."""
-        print("\n--- 드론 명령 콘솔 ---")
+        print("\n드론 명령 콘솔")
         print("  [비행 제어]")
         print("    start                    - 드론 시동 및 ARM (처음)")
         print("    takeoff                  - 이륙")
@@ -156,19 +156,19 @@ class InteractiveMissionNode(BaseMissionNode):
             self.get_logger().info("사용자 명령: START. 드론 시동 및 ARM.")
             self.start_mission()
         else:
-            self.get_logger().warn(f"START 명령을 사용할 수 없는 상태입니다: {self.state}")
+            self.get_logger().warn(f"START 명령을 사용할 수 없는 상태: {self.state}")
     
     def _handle_takeoff_command(self):
         if self.state == "ARMED_IDLE":
             self.state = "TAKING_OFF"
         else:
-            self.get_logger().warn(f"이륙할 수 없는 상태입니다: {self.state}")
+            self.get_logger().warn(f"이륙할 수 없는 상태: {self.state}")
     
     def _handle_land_command(self):
         if self.state in ["IDLE", "MOVING", "TAKING_OFF"]:
             self.state = "LANDING"
         else:
-            self.get_logger().warn(f"착륙할 수 없는 상태입니다: {self.state}")
+            self.get_logger().warn(f"착륙할 수 없는 상태: {self.state}")
     
     def _handle_arm_command(self):
         if self.state == "LANDED":
@@ -176,7 +176,7 @@ class InteractiveMissionNode(BaseMissionNode):
             dcu.arm_and_offboard(self)
             self.state = "ARMED_IDLE"
         else:
-            self.get_logger().warn(f"ARM은 LANDED 상태에서만 가능합니다. 현재 상태: {self.state}")
+            self.get_logger().warn(f"ARM은 LANDED 상태에서만 가능. 현재 상태: {self.state}")
     
     def _handle_stop_command(self):
         if self.state in ["IDLE", "MOVING", "TAKING_OFF", "HEADING"]:
@@ -186,14 +186,14 @@ class InteractiveMissionNode(BaseMissionNode):
                 self.target_yaw_deg = None  # yaw 제어 해제
                 self.state = "IDLE"
             else:
-                self.get_logger().warn("현재 위치를 알 수 없어 정지할 수 없습니다.")
+                self.get_logger().warn("현재 위치를 알 수 없어 정지할 수 없음")
         else:
-            self.get_logger().warn(f"정지할 수 없는 상태입니다: {self.state}")
+            self.get_logger().warn(f"정지할 수 없는 상태: {self.state}")
     
     def _handle_move_command(self, command, target_str, use_stare_targets=True):
         try:
             if self.state not in ["IDLE", "MOVING", "HEADING"]:
-                self.get_logger().warn(f"'{command}' 명령을 실행할 수 없는 상태입니다: {self.state}")
+                self.get_logger().warn(f"'{command}' 명령을 실행할 수 없는 상태: {self.state}")
                 return
             
             if target_str == "final":
@@ -396,7 +396,7 @@ class InteractiveMissionNode(BaseMissionNode):
             self.get_logger().error("각도 값이 잘못되었습니다. 숫자를 입력하세요.")
     
 
-    # --- 시각화 ---
+            # 시각화
     
     def _publish_all_markers(self):
         """모든 웨이포인트와 주시 타겟 위치에 마커를 게시합니다."""
@@ -405,7 +405,7 @@ class InteractiveMissionNode(BaseMissionNode):
         )
         self.visual_marker_publisher.publish(marker_array)
     
-    # --- 미션 로직 구현 (BaseMissionNode의 추상 메서드) ---
+    # 미션 로직 구현 (BaseMissionNode의 추상 메서드)
     
     def run_mission_logic(self):
         """대화형 미션의 상태 머신 로직을 구현합니다."""

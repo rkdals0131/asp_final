@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Waypoint Parser Utility
-웨이포인트 CSV 파일을 파싱하는 유틸리티 함수들을 제공합니다.
+웨이포인트 CSV 파일을 파싱하는 유틸리티 함수들을 제공
 
 CSV 형식: x, y, mission_state, target_speed
 - x: X 좌표 (float)
@@ -47,7 +47,7 @@ class WaypointParser:
     @staticmethod
     def parse_csv_file(file_path: str) -> List[WaypointData]:
         """
-        CSV 파일에서 웨이포인트를 파싱합니다.
+        CSV 파일에서 웨이포인트를 파싱
         
         Args:
             file_path: CSV 파일 경로
@@ -60,7 +60,7 @@ class WaypointParser:
             ValueError: CSV 형식이 올바르지 않을 때
         """
         if not os.path.exists(file_path):
-            raise FileNotFoundError(f"웨이포인트 파일을 찾을 수 없습니다: {file_path}")
+            raise FileNotFoundError(f"웨이포인트 파일을 찾을 수 없음: {file_path}")
         
         waypoints = []
         
@@ -75,7 +75,7 @@ class WaypointParser:
                     
                     # 최소 2개 값 (x, y) 필요
                     if len(row) < 2:
-                        logging.warning(f"줄 {row_idx + 1}: 최소 2개 값(x, y)이 필요합니다. 건너뜁니다.")
+                        logging.warning(f"줄 {row_idx + 1}: 최소 2개 값(x, y)이 필요. 건너뜀")
                         continue
                     
                     try:
@@ -104,15 +104,15 @@ class WaypointParser:
             raise ValueError(f"CSV 파일 읽기 오류: {e}")
         
         if not waypoints:
-            raise ValueError("유효한 웨이포인트가 없습니다.")
+            raise ValueError("유효한 웨이포인트가 없음")
         
-        logging.info(f"총 {len(waypoints)}개의 웨이포인트를 로드했습니다.")
+        logging.info(f"총 {len(waypoints)}개의 웨이포인트를 로드했음")
         return waypoints
     
     @staticmethod
     def waypoints_to_ros_params(waypoints: List[WaypointData]) -> dict:
         """
-        웨이포인트 리스트를 ROS 파라미터 형태로 변환합니다.
+        웨이포인트 리스트를 ROS 파라미터 형태로 변환
         
         Args:
             waypoints: WaypointData 객체들의 리스트
@@ -145,7 +145,7 @@ class WaypointParser:
     @staticmethod
     def validate_waypoints(waypoints: List[WaypointData]) -> bool:
         """
-        웨이포인트 데이터의 유효성을 검사합니다.
+        웨이포인트 데이터의 유효성을 검사
         
         Args:
             waypoints: 검사할 웨이포인트 리스트
@@ -154,7 +154,7 @@ class WaypointParser:
             유효성 여부
         """
         if not waypoints:
-            logging.error("웨이포인트가 비어있습니다.")
+            logging.error("웨이포인트가 비어있음")
             return False
         
         valid = True
@@ -175,7 +175,7 @@ class WaypointParser:
     @staticmethod
     def get_mission_summary(waypoints: List[WaypointData]) -> dict:
         """
-        미션 요약 정보를 반환합니다.
+        미션 요약 정보를 반환
         
         Args:
             waypoints: 웨이포인트 리스트
@@ -209,7 +209,7 @@ class WaypointParser:
 
 def load_waypoints_from_csv(file_path: str) -> List[WaypointData]:
     """
-    편의 함수: CSV 파일에서 웨이포인트를 로드합니다.
+    편의 함수: CSV 파일에서 웨이포인트를 로드
     
     Args:
         file_path: CSV 파일 경로
@@ -222,7 +222,7 @@ def load_waypoints_from_csv(file_path: str) -> List[WaypointData]:
 
 def waypoints_to_ros_params(waypoints: List[WaypointData]) -> dict:
     """
-    편의 함수: 웨이포인트를 ROS 파라미터로 변환합니다.
+    편의 함수: 웨이포인트를 ROS 파라미터로 변환
     
     Args:
         waypoints: WaypointData 객체들의 리스트

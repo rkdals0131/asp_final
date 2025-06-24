@@ -6,14 +6,14 @@ from rclpy.parameter import Parameter
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from rcl_interfaces.msg import ParameterDescriptor
 
-# --- 메시지 타입 임포트 ---
+# 메시지 타입 임포트
 from px4_msgs.msg import VehicleLocalPosition
 from nav_msgs.msg import Odometry
 from std_msgs.msg import String
 from sensor_msgs.msg import Image
 from vision_msgs.msg import Detection3DArray
 
-# --- TF2 관련 임포트 ---
+# TF2 관련 임포트
 from tf2_ros import TransformException
 from tf2_ros.buffer import Buffer
 from tf2_ros.transform_listener import TransformListener
@@ -26,15 +26,15 @@ import re
 class UAVDashboard(Node):
     """
     드론과 차량의 시스템 상태, 임무 정보, 원격측정 데이터를
-    하나의 터미널에 실시간으로 표시하는 통합 대시보드 노드.
-    순수한 시각화 담당으로 완성된 상태 정보만 표시합니다.
+    하나의 터미널에 실시간으로 표시하는 통합 대시보드 노드
+    순수한 시각화 담당으로 완성된 상태 정보만 표시
     """
 
     def __init__(self):
         super().__init__('dashboard_node')
         self.set_parameters([Parameter('use_sim_time', value=True)])
 
-        # === 파라미터 선언 ===
+        # 파라미터 선언
         self.declare_parameter('px4_local_pos_topic', '/fmu/out/vehicle_local_position',
             ParameterDescriptor(description="PX4 로컬 위치 토픽"))
         self.declare_parameter('vehicle_odom_topic', '/model/X1/odometry',
@@ -78,7 +78,7 @@ class UAVDashboard(Node):
         self.check_timeout = self.get_parameter('check_timeout').value
         self.node_timeout = self.get_parameter('node_timeout').value
 
-        # --- ANSI 색상 코드 ---
+        # ANSI 색상 코드
         self.COLOR_GREEN = '\033[92m'
         self.COLOR_RED = '\033[91m'
         self.COLOR_YELLOW = '\033[93m'
@@ -88,7 +88,7 @@ class UAVDashboard(Node):
         self.COLOR_BOLD = '\033[1m'
         self.COLOR_END = '\033[0m'
 
-        # --- 데이터 저장을 위한 멤버 변수 ---
+        # 데이터 저장을 위한 멤버 변수
         self.drone_local_pos = None     # GPS 기준점(ref) 및 속도 정보용
         self.vehicle_odom = None        # 차량 속도 정보용
         self.detected_markers = {}      # 마커 ID별로 정보 저장: {id: {'pose': pose, 'stamp': stamp}}
@@ -103,11 +103,11 @@ class UAVDashboard(Node):
         self.drone_state = "INITIALIZING"
         self.vehicle_state = "INITIALIZING"
         
-        # --- 미션 상태 변수 (단순히 받아서 표시만) ---
+        # 미션 상태 변수 (단순히 받아서 표시만)
         self.mission_status_raw = "INIT"  # 원본 상태 문자열
         self.mission_elapsed_time = 0.0
 
-        # --- Pre-flight Check를 위한 변수 ---
+        # Pre-flight Check를 위한 변수
         self.topic_last_seen = {
             'PX4_LOC_POS': 0.0,
             'VEHICLE_ODOM': 0.0,
@@ -118,7 +118,7 @@ class UAVDashboard(Node):
         }
         self.tf_status = False
         
-        # --- 노드 활성화 상태 추적 ---
+        # 노드 활성화 상태 추적
         self.node_status = {
             'mission_admin': False,
             'path_follower': False, 
@@ -129,7 +129,7 @@ class UAVDashboard(Node):
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self, spin_thread=True)
 
-        # --- QoS 프로파일 정의 ---
+        # QoS 프로파일 정의
         qos_best_effort = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT, 
             durability=DurabilityPolicy.VOLATILE, 
@@ -143,7 +143,7 @@ class UAVDashboard(Node):
             depth=10
         )
 
-        # --- Subscriber 초기화 (파라미터 기반) ---
+        # Subscriber 초기화 (파라미터 기반)
         self.create_subscription(VehicleLocalPosition, self.px4_topic, self.drone_local_pos_callback, qos_best_effort)
         self.create_subscription(Odometry, self.vehicle_odom_topic, self.vehicle_odometry_callback, qos_reliable)
         self.create_subscription(Image, self.camera_topic, self.camera_image_callback, qos_best_effort)
@@ -157,7 +157,7 @@ class UAVDashboard(Node):
         
         self.get_logger().info("UAV Telemetry Dashboard v3.0 초기화 완료 - 순수 시각화 모드")
 
-    # --- 콜백 함수들 ---
+    # 콜백 함수들
     def get_current_time_sec(self):
         return self.get_clock().now().nanoseconds / 1e9
 
@@ -218,9 +218,9 @@ class UAVDashboard(Node):
             self.mission_status_raw = msg.data
             self.mission_elapsed_time = 0.0
 
-    # --- 데이터 처리 및 포맷팅 ---
+    # 데이터 처리 및 포맷팅
     def update_tf_poses(self):
-        """TF Listener를 사용하여 드론과 차량의 월드 좌표를 업데이트합니다."""
+        """TF Listener를 사용하여 드론과 차량의 월드 좌표를 업데이트"""
         try:
             # TF lookup용 완전한 프레임 ID 구성 (base_link 접미사 추가)
             full_drone_frame_id = f"{self.drone_frame_id}/base_link"
@@ -239,8 +239,8 @@ class UAVDashboard(Node):
 
     def enu_to_gps(self, x, y, z, ref_lat, ref_lon, ref_alt):
         """
-        ENU 월드 좌표(map 기준)를 GPS 좌표로 변환합니다.
-        PX4의 ref_lat/lon/alt를 기준점으로 사용합니다.
+        ENU 월드 좌표(map 기준)를 GPS 좌표로 변환
+        PX4의 ref_lat/lon/alt를 기준점으로 사용
         """
         if ref_lat == 0.0 or ref_lon == 0.0:
             return None, None, None
@@ -292,7 +292,7 @@ class UAVDashboard(Node):
             elif node_name == 'offboard_control':
                 self.node_status[node_name] = (now - self.topic_last_seen['DRONE_STATE']) < self.node_timeout
 
-    # --- 메인 업데이트 루프 ---
+    # 메인 업데이트 루프
     def update_dashboard(self):
         # 1. TF 정보 업데이트
         self.update_tf_poses()
@@ -318,7 +318,7 @@ class UAVDashboard(Node):
         # 4. 화면 클리어 및 대시보드 그리기
         os.system('clear')
         
-        # === 섹션 1 & 2: 시스템 상태와 미션 상태를 좌우로 나란히 표시 ===
+        # 섹션 1 & 2: 시스템 상태와 미션 상태를 좌우로 나란히 표시
         print(f"{self.COLOR_BOLD}{'='*70}{self.COLOR_END}")
         
         # 헤더 라인
@@ -403,7 +403,7 @@ class UAVDashboard(Node):
             sys_padded = sys_line + " " * (35 - len(sys_clean))
             print(f"{sys_padded}{mission_line}")
 
-        # === 섹션 3: 마커 감지 (Marker Detections) ==========================
+        # 섹션 3: 마커 감지 (Marker Detections)
         print(f"\n{self.COLOR_BOLD}{'-'*70}\n{'Marker Detections':^70}\n{'-'*70}{self.COLOR_END}")
 
         header = f"  {'ID':<4} | {'WORLD POS (m)':<25} | {'STATUS':<20} | {'FIRST SEEN':<10}"
@@ -444,10 +444,10 @@ class UAVDashboard(Node):
             line = f"  {marker_id:<4} | {pos_padded} | {status_padded} | {time_str:<10}"
             print(line)
             
-        # === 섹션 4: 플랫폼 원격측정 (Telemetry) =========================
+        # 섹션 4: 플랫폼 원격측정 (Telemetry)
         print(f"\n{self.COLOR_BOLD}{'-'*70}\n{'PLATFORM TELEMETRY':^70}\n{'-'*70}{self.COLOR_END}")
         
-        # --- 드론 정보 ---
+        # 드론 정보
         print(f"  {self.COLOR_BOLD}DRONE ({self.drone_frame_id}){self.COLOR_END}")
         
         # Line 1: State and World Pos
@@ -483,7 +483,7 @@ class UAVDashboard(Node):
         vel_padded = vel_str + " " * (35 - len(vel_clean))
         print(f"  {vel_padded}{gps_str}")
         
-        # --- 차량 정보 ---
+        # 차량 정보
         print(f"\n  {self.COLOR_BOLD}VEHICLE ({self.vehicle_frame_id}){self.COLOR_END}")
         
         # Line 1: State and World Pos

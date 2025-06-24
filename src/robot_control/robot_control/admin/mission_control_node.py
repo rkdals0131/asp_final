@@ -6,13 +6,13 @@ from rclpy.parameter import Parameter
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from rcl_interfaces.msg import ParameterDescriptor
 
-# --- 메시지 타입 임포트 ---
+# 메시지 타입 임포트
 from px4_msgs.msg import VehicleLocalPosition, VehicleAttitude, TakeoffStatus
 from nav_msgs.msg import Odometry
 from std_msgs.msg import String
 from mission_admin_interfaces.srv import MissionComplete
 
-# --- TF2 관련 임포트 ---
+# TF2 관련 임포트
 from tf2_ros import TransformException
 from tf2_ros.buffer import Buffer
 from tf2_ros.transform_listener import TransformListener
@@ -27,16 +27,16 @@ from typing import Optional, Dict, List
 
 class SimpleMissionControl(Node):
     """
-    간단한 터미널 기반 미션 컨트롤.
-    미션 상태를 관리하고 dashboard에 상태 정보를 발행합니다.
-    ROS 시간 기반으로 동작하며 필요한 최소한의 정보만 구독합니다.
+    간단한 터미널 기반 미션 컨트롤
+    미션 상태를 관리하고 dashboard에 상태 정보를 발행
+    ROS 시간 기반으로 동작하며 필요한 최소한의 정보만 구독
     """
 
     def __init__(self):
         super().__init__('mission_control_node')
         self.set_parameters([Parameter('use_sim_time', value=True)])
 
-        # === 파라미터 선언 ===
+        # 파라미터 선언
         self.declare_parameter('check_timeout', 2.0,
             ParameterDescriptor(description="토픽 수신 타임아웃 (초)"))
         self.declare_parameter('drone_frame_id', 'x500_gimbal_0',
@@ -52,7 +52,7 @@ class SimpleMissionControl(Node):
         self.vehicle_frame_id = self.get_parameter('vehicle_frame_id').value
         self.map_frame = self.get_parameter('map_frame').value
 
-        # --- 미션 상태 정의 ---
+        # 미션 상태 정의
         self.MISSION_STATES = {
             'INIT': '시스템 초기화 중',
             'READY': '미션 시작 준비 완료',
@@ -66,7 +66,7 @@ class SimpleMissionControl(Node):
             'MISSION_ABORT': '미션 중단'
         }
 
-        # --- 미션 단계별 ID 정의 ---
+        # 미션 단계별 ID 정의
         self.MISSION_IDS = {
             'UGV_TAKEOFF_ARRIVAL': 1,
             'DRONE_TAKEOFF_COMPLETE': 2,
@@ -75,24 +75,24 @@ class SimpleMissionControl(Node):
             'DRONE_HOVER_COMPLETE': 5
         }
 
-        # --- 상태 변수 ---
+        # 상태 변수
         self.mission_state = 'INIT'
         self.ugv_state = "INITIALIZING"
         self.drone_state = "INITIALIZING"
         self.mission_start_time = None  # ROS 시간으로 변경
         self.running = True
 
-        # --- 미션 플래그 ---
+        # 미션 플래그
         self.ugv_ready_for_landing = False
         self.drone_ready_for_landing = False
         self.landing_command_sent = False
         self.mission_end_time = None
 
-        # --- 플랫폼 데이터 (필요한 최소한만) ---
+        # 플랫폼 데이터 (필요한 최소한만)
         self.drone_local_pos = None
         self.vehicle_odom = None
 
-        # --- Pre-flight Check 변수 ---
+        # Pre-flight Check 변수
         self.topic_last_seen = {
             'PX4_LOC_POS': 0.0,
             'VEHICLE_ODOM': 0.0,
@@ -103,7 +103,7 @@ class SimpleMissionControl(Node):
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self, spin_thread=True)
 
-        # --- QoS 프로파일 정의 ---
+        # QoS 프로파일 정의
         qos_best_effort = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT, 
             durability=DurabilityPolicy.VOLATILE, 
@@ -117,25 +117,25 @@ class SimpleMissionControl(Node):
             depth=10
         )
 
-        # --- Subscriber 초기화 (필요한 최소한만) ---
+        # Subscriber 초기화 (필요한 최소한만)
         self.create_subscription(VehicleLocalPosition, "/fmu/out/vehicle_local_position", self.drone_local_pos_callback, qos_best_effort)
         self.create_subscription(Odometry, "/model/X1/odometry", self.vehicle_odometry_callback, qos_reliable)
         self.create_subscription(String, "/drone/state", self.drone_state_callback, qos_reliable)
         self.create_subscription(String, "/vehicle/state", self.vehicle_state_callback, qos_reliable)
 
-        # --- 서비스 서버 생성 ---
+        # 서비스 서버 생성
         self.mission_complete_srv = self.create_service(
             MissionComplete, 
             '/mission_complete', 
             self.mission_complete_callback
         )
 
-        # --- 미션 컨트롤 퍼블리셔 ---
+        # 미션 컨트롤 퍼블리셔
         self.ugv_command_pub = self.create_publisher(String, '/ugv/mission_command', 10)
         self.drone_command_pub = self.create_publisher(String, '/drone/mission_command', 10)
         self.marker_detector_command_pub = self.create_publisher(String, '/multi_tracker/command', 10)
         
-        # --- 미션 상태 퍼블리셔 (Dashboard용) ---
+        # 미션 상태 퍼블리셔 (Dashboard용)
         self.mission_status_pub = self.create_publisher(String, '/mission/status', 10)
 
         # 데이터 업데이트 타이머
@@ -158,7 +158,7 @@ class SimpleMissionControl(Node):
         self.running = False
         self.get_logger().info("종료 중...")
         
-    # --- 콜백 함수들 ---
+    # 콜백 함수들
     def get_current_time_sec(self):
         return self.get_clock().now().nanoseconds / 1e9
 
@@ -172,7 +172,7 @@ class SimpleMissionControl(Node):
 
     def drone_state_callback(self, msg: String):
         if self.drone_state != msg.data:
-            self.get_logger().info(f"🚁 드론 상태: {self.drone_state} -> {msg.data}")
+            self.get_logger().info(f"드론 상태: {self.drone_state} -> {msg.data}")
         self.drone_state = msg.data
 
         # 드론이 Disarmed 상태가 되면 미션 완료 처리
@@ -181,15 +181,15 @@ class SimpleMissionControl(Node):
                 self.mission_state = 'MISSION_COMPLETE'
                 self.mission_end_time = self.get_clock().now()
                 self.publish_mission_status()
-                self.get_logger().info("🎯 미션 완료! 드론 Disarmed 확인.")
+                self.get_logger().info("미션 완료! 드론 Disarmed 확인")
 
     def vehicle_state_callback(self, msg: String):
         if self.ugv_state != msg.data:
-            self.get_logger().info(f"🚗 UGV 상태: {self.ugv_state} -> {msg.data}")
+            self.get_logger().info(f"UGV 상태: {self.ugv_state} -> {msg.data}")
             
             # UGV가 COMPLETE 상태가 되면 랑데부 준비 완료 플래그 설정
             if msg.data == "COMPLETE" and not self.ugv_ready_for_landing:
-                self.get_logger().info("✅ UGV 랑데부 준비 완료")
+                self.get_logger().info("UGV 랑데부 준비 완료")
                 self.ugv_ready_for_landing = True
                 self._check_and_start_landing()
                 
@@ -198,7 +198,7 @@ class SimpleMissionControl(Node):
     def mission_complete_callback(self, request, response):
         """미션 완료 신호 처리 - 단순화된 상태 머신"""
         mission_id = request.mission_id
-        self.get_logger().info(f"🔧 Debug: 미션 완료 신호 수신 - ID: {mission_id}, 현재 상태: {self.mission_state}")
+        self.get_logger().info(f"Debug: 미션 완료 신호 수신 - ID: {mission_id}, 현재 상태: {self.mission_state}")
         
         # 상태 전이 로직을 단순한 매핑으로 정리
         state_transitions = {
@@ -206,7 +206,7 @@ class SimpleMissionControl(Node):
                 'expected_states': ['UGV_TO_TAKEOFF'],
                 'next_state': 'DRONE_ARMING',
                 'action': lambda: self.drone_command_pub.publish(String(data='start')),
-                'message': "✅ UGV가 이륙 위치에 도착. 드론 시작 명령 전송"
+                'message': "UGV가 이륙 위치에 도착. 드론 시작 명령 전송"
             },
             self.MISSION_IDS['DRONE_TAKEOFF_COMPLETE']: {
                 'expected_states': ['DRONE_ARMING', 'DRONE_TAKEOFF'],
@@ -215,25 +215,25 @@ class SimpleMissionControl(Node):
                     self.ugv_command_pub.publish(String(data='resume')),
                     self.drone_command_pub.publish(String(data='start'))
                 ],
-                'message': "✅ 드론 이륙 완료. UGV resume 시작"
+                'message': "드론 이륙 완료. UGV resume 시작"
             },
             self.MISSION_IDS['UGV_MISSION_COMPLETE']: {
                 'expected_states': ['MISSION_ACTIVE', 'DRONE_APPROACH', 'DRONE_HOVER', 'MISSION_COMPLETE'],
                 'next_state': None,  # 상태 변경 없음
                 'action': None,
-                'message': "✅ UGV 미션 완료"
+                'message': "UGV 미션 완료"
             },
             self.MISSION_IDS['DRONE_APPROACH_COMPLETE']: {
                 'expected_states': ['MISSION_ACTIVE', 'LANDING_STANDBY'],
                 'next_state': 'LANDING_STANDBY',
                 'action': self._set_drone_ready_for_landing,
-                'message': "✅ 드론 최종 지점 도착. UGV 도착 대기."
+                'message': "드론 최종 지점 도착. UGV 도착 대기"
             },
             self.MISSION_IDS['DRONE_HOVER_COMPLETE']: {
                 'expected_states': ['LANDING_STANDBY', 'PRECISION_LANDING', 'MISSION_COMPLETE'],
                 'next_state': 'MISSION_COMPLETE',
                 'action': None,
-                'message': "🎯 미션 완료!"
+                'message': "미션 완료!"
             }
         }
         
@@ -258,13 +258,13 @@ class SimpleMissionControl(Node):
                 self.get_logger().info(transition['message'])
                 response.success = True
             else:
-                self.get_logger().warn(f"❌ 미션 ID {mission_id} 거부: 현재 상태 {self.mission_state} not in {transition['expected_states']}")
+                self.get_logger().warn(f"미션 ID {mission_id} 거부: 현재 상태 {self.mission_state} not in {transition['expected_states']}")
                 response.success = False
         else:
-            self.get_logger().warn(f"❌ 알 수 없는 미션 ID: {mission_id}")
+            self.get_logger().warn(f"알 수 없는 미션 ID: {mission_id}")
             response.success = False
             
-        self.get_logger().info(f"🔧 Debug: 응답 - success: {response.success}")
+        self.get_logger().info(f"Debug: 응답 - success: {response.success}")
         return response
 
     def publish_mission_status(self):
@@ -315,7 +315,7 @@ class SimpleMissionControl(Node):
             
             if all([px4_ok, vehicle_odom_ok]):
                 self.mission_state = 'READY'
-                self.get_logger().info("🟢 시스템 준비 완료! 's' 키를 눌러 미션을 시작하세요.")
+                self.get_logger().info("시스템 준비 완료! 's' 키를 눌러 미션을 시작하세요")
         
         elif self.mission_state == 'DRONE_ARMING':
             if self.drone_state in ['ARMED_IDLE', 'TAKING_OFF']:
@@ -330,9 +330,9 @@ class SimpleMissionControl(Node):
         if self.mission_start_time:
             elapsed_ns = (self.get_clock().now() - self.mission_start_time).nanoseconds
             elapsed_sec = elapsed_ns / 1e9
-            print(f"🎯 미션 상태: {self.mission_state} | 경과시간: {elapsed_sec:.1f}초")
+            print(f"미션 상태: {self.mission_state} | 경과시간: {elapsed_sec:.1f}초")
         else:
-            print(f"🎯 미션 상태: {self.mission_state}")
+            print(f"미션 상태: {self.mission_state}")
 
     def input_loop(self):
         """키보드 입력 처리 루프"""
@@ -349,13 +349,13 @@ class SimpleMissionControl(Node):
                     if self.mission_state == 'READY':
                         self.start_mission()
                     else:
-                        print(f"❌ 현재 상태({self.mission_state})에서는 미션을 시작할 수 없습니다.")
+                        print(f"현재 상태({self.mission_state})에서는 미션을 시작할 수 없습니다")
                 elif command == 'a':
                     self.abort_mission()
                 elif command == 'r':
                     self.reset_mission()
                 else:
-                    print("❌ 알 수 없는 명령어입니다. 's', 'a', 'r', 'q' 중 하나를 입력하세요.")
+                    print("알 수 없는 명령어입니다. 's', 'a', 'r', 'q' 중 하나를 입력하세요")
                     
             except EOFError:
                 break
@@ -369,7 +369,7 @@ class SimpleMissionControl(Node):
         
         self.ugv_command_pub.publish(String(data='go'))
         self.publish_mission_status()
-        self.get_logger().info("🚀 미션 시작! UGV가 이륙 지점으로 이동합니다.")
+        self.get_logger().info("미션 시작! UGV가 이륙 지점으로 이동")
 
     def abort_mission(self):
         """미션 중단"""
@@ -378,7 +378,7 @@ class SimpleMissionControl(Node):
         self.ugv_command_pub.publish(String(data='stop'))
         self.drone_command_pub.publish(String(data='land'))
         self.publish_mission_status()
-        self.get_logger().warn("⛔ 미션 중단!")
+        self.get_logger().warn("미션 중단!")
 
     def reset_mission(self):
         """미션 상태 리셋"""
@@ -389,19 +389,19 @@ class SimpleMissionControl(Node):
         self.drone_ready_for_landing = False
         self.landing_command_sent = False
         self.publish_mission_status()
-        self.get_logger().info("🔄 미션 상태 리셋")
+        self.get_logger().info("미션 상태 리셋")
 
     def _set_drone_ready_for_landing(self):
-        """드론 랑데부 준비완료 플래그를 설정하고, 착륙 시작 조건을 확인합니다."""
+        """드론 랑데부 준비완료 플래그를 설정하고, 착륙 시작 조건을 확인"""
         if not self.drone_ready_for_landing:
-            self.get_logger().info("✅ 드론 랑데부 준비 완료")
+            self.get_logger().info("드론 랑데부 준비 완료")
             self.drone_ready_for_landing = True
             self._check_and_start_landing()
 
     def _check_and_start_landing(self):
-        """UGV와 드론이 모두 준비되었는지 확인하고 정밀 착륙을 시작합니다."""
+        """UGV와 드론이 모두 준비되었는지 확인하고 정밀 착륙을 시작"""
         if self.ugv_ready_for_landing and self.drone_ready_for_landing and not self.landing_command_sent:
-            self.get_logger().info("🚀 모든 플랫폼 준비 완료. 정밀 착륙 시퀀스 시작!")
+            self.get_logger().info("모든 플랫폼 준비 완료. 정밀 착륙 시퀀스 시작!")
             self.mission_state = 'PRECISION_LANDING'
             self.publish_mission_status()
             

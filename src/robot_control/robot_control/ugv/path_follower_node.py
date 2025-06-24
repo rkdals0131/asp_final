@@ -14,13 +14,14 @@ from tf2_ros import TransformException
 
 import math
 import numpy as np
-from scipy.interpolate import splprep, splev
 import threading
 import sys
 import os
-import yaml
 
 from robot_control.utils.waypoint_parser import load_waypoints_from_csv, WaypointData
+from robot_control.ugv.path_planner import PathPlanner
+from robot_control.ugv.velocity_profiler import VelocityProfiler
+from robot_control.ugv.pure_pursuit import PurePursuitController
 
 class PathFollowerNode(Node):
     """
@@ -52,13 +53,6 @@ class PathFollowerNode(Node):
         # === 경로 로딩 파라미터 ===
         self.declare_parameter('waypoint_file', '')
         self.declare_parameter('use_mission_ids', True)
-        
-        # === ROS2 파라미터 기반 웨이포인트 ===
-        self.declare_parameter('waypoints', [0.0])
-        self.declare_parameter('mission_types', [1])
-        self.declare_parameter('target_speeds', [-1.0])
-        self.declare_parameter('waypoint_names', ["default"])
-        self.declare_parameter('default_speed', 3.0)
 
         # 파라미터 로딩
         self.MAX_JERK_WITH_DRONE = self.get_parameter('max_jerk_with_drone').value
@@ -90,16 +84,32 @@ class PathFollowerNode(Node):
         self.is_mission_paused = False
         self.is_mission_complete = False
         self.current_waypoint_idx = 0
-        self.last_closest_idx = 0
         self.is_orienting = False
+        self.last_closest_idx = 0  # 원본에서 사용하던 변수
+
+        # === 리팩토링된 모듈 초기화 ===
+        self.path_planner = PathPlanner(path_density=self.PATH_DENSITY)
+        self.velocity_profiler = VelocityProfiler(
+            max_speed=self.MAX_SPEED,
+            min_speed=self.MIN_SPEED,
+            max_accel=self.current_max_accel,
+            max_decel=self.MAX_DECEL,
+            max_jerk=self.current_max_jerk,
+            max_lateral_accel=self.MAX_LATERAL_ACCEL
+        )
+        self.pursuit_controller = PurePursuitController(
+            lookahead_k=self.LOOKAHEAD_K,
+            lookahead_min=self.LOOKAHEAD_MIN,
+            lookahead_max=self.LOOKAHEAD_MAX
+        )
 
         # 경로 데이터
         self.raw_waypoints = self._load_waypoints()
         if not self.raw_waypoints:
-            self.get_logger().error("❌ 웨이포인트 로드 실패. 노드 종료.")
-            return
+            self.get_logger().error("웨이포인트 로드 실패. 노드 종료")
+            raise Exception("웨이포인트 로드 실패")
             
-        self.main_path_points = self._generate_path_points_from_list(self.raw_waypoints)
+        self.main_path_points = self.path_planner.generate_path_from_waypoints(self.raw_waypoints)
         self.full_path_points = []
         self.full_target_velocities = []
 
@@ -135,12 +145,12 @@ class PathFollowerNode(Node):
         self.input_thread = threading.Thread(target=self._command_input_loop, daemon=True)
         self.input_thread.start()
         
-        self.get_logger().info("🚗 S-Curve Path Follower v4.0 초기화 완료")
+        self.get_logger().info("S-Curve Path Follower v4.0 초기화 완료")
         self.get_logger().info(f"   - 웨이포인트 파일: {self.waypoint_file if self.waypoint_file else '기본 경로'}")
         self.get_logger().info(f"   - 로드된 웨이포인트: {len(self.raw_waypoints)}개")
         self.get_logger().info("   - 현재 모드: [With Drone]. 'go' 명령 대기 중")
         self.get_logger().info("=" * 60)
-        self.get_logger().info("🚀 미션을 시작하려면 터미널에서 'go'를 입력하고 Enter를 누르세요!")
+        self.get_logger().info("미션을 시작하려면 터미널에서 'go'를 입력하고 Enter를 누르세요!")
         self.get_logger().info("=" * 60)
 
     def odom_callback(self, msg: Odometry):
@@ -149,7 +159,7 @@ class PathFollowerNode(Node):
     def mission_command_callback(self, msg: String):
         """미션 컨트롤 대시보드로부터 명령 수신"""
         command = msg.data.lower().strip()
-        self.get_logger().info(f"📡 대시보드 명령 수신: '{command}'")
+        self.get_logger().info(f"대시보드 명령 수신: '{command}'")
         self._process_command(command)
 
     def _process_command(self, cmd: str):
@@ -157,22 +167,22 @@ class PathFollowerNode(Node):
         if not cmd:
             return
             
-        self.get_logger().info(f"⚙️ 명령 처리 중: '{cmd}'")
+        self.get_logger().info(f"명령 처리 중: '{cmd}'")
         
         if self.is_waiting_for_go and cmd == 'go':
             self.is_waiting_for_go = False
             self.path_update_timer.cancel()
-            self.get_logger().info("🚀 GO 명령 수신! 미션을 시작합니다.")
+            self.get_logger().info("GO 명령 수신! 미션을 시작")
         elif self.is_mission_paused and cmd == 'resume':
             self._resume_mission()
         elif cmd == 'stop':
             self._stop_vehicle()
             self.is_mission_paused = True
-            self.get_logger().info("⛔ STOP 명령 수신! 미션을 일시 중지합니다.")
+            self.get_logger().info("STOP 명령 수신! 미션을 일시 중지")
         else:
             current_state = "WAITING_FOR_GO" if self.is_waiting_for_go else \
                            "PAUSED" if self.is_mission_paused else "ACTIVE"
-            self.get_logger().warn(f"❌ 현재 상태({current_state})에서 유효하지 않은 명령: '{cmd}'")
+            self.get_logger().warn(f"현재 상태({current_state})에서 유효하지 않은 명령: '{cmd}'")
 
     def publish_state(self):
         """현재 상태를 퍼블리시"""
@@ -192,11 +202,11 @@ class PathFollowerNode(Node):
     def send_mission_complete(self, mission_id: int):
         """미션 완료 신호를 미션 컨트롤에 전송"""
         if not self.use_mission_ids:
-            self.get_logger().info(f"📡 미션 완료 신호 전송 비활성화됨 (ID: {mission_id})")
+            self.get_logger().info(f"미션 완료 신호 전송 비활성화됨 (ID: {mission_id})")
             return
             
         if not self.mission_complete_client.wait_for_service(timeout_sec=1.0):
-            self.get_logger().warn(f"미션 컨트롤 서비스를 찾을 수 없습니다 (ID: {mission_id}) - 서비스 없이 계속 진행")
+            self.get_logger().warn(f"미션 컨트롤 서비스를 찾을 수 없음 (ID: {mission_id}) - 서비스 없이 계속 진행")
             return
             
         request = MissionComplete.Request()
@@ -208,13 +218,13 @@ class PathFollowerNode(Node):
             
             if future.result() is not None:
                 if future.result().success:
-                    self.get_logger().info(f"✅ 미션 완료 신호 전송 성공 (ID: {mission_id})")
+                    self.get_logger().info(f"미션 완료 신호 전송 성공 (ID: {mission_id})")
                 else:
-                    self.get_logger().warn(f"⚠️ 미션 완료 신호 거부됨 (ID: {mission_id}) - 계속 진행")
+                    self.get_logger().warn(f"미션 완료 신호 거부됨 (ID: {mission_id}) - 계속 진행")
             else:
-                self.get_logger().warn(f"⚠️ 미션 완료 신호 전송 타임아웃 (ID: {mission_id}) - 계속 진행")
+                self.get_logger().warn(f"미션 완료 신호 전송 타임아웃 (ID: {mission_id}) - 계속 진행")
         except Exception as e:
-            self.get_logger().warn(f"⚠️ 미션 완료 신호 전송 실패 (ID: {mission_id}): {e} - 계속 진행")
+            self.get_logger().warn(f"미션 완료 신호 전송 실패 (ID: {mission_id}): {e} - 계속 진행")
 
     def _update_vehicle_pose(self):
         try:
@@ -239,39 +249,36 @@ class PathFollowerNode(Node):
         if self.is_orienting:
             if self._orient_vehicle_for_next_segment():
                 self.is_orienting = False
-                self.get_logger().info("✅ Vehicle oriented. Continuing mission.")
+                self.get_logger().info("Vehicle oriented. Continuing mission")
             return
 
         if self.is_waiting_for_go or self.is_mission_complete or self.is_mission_paused:
             # 디버깅: 왜 정지했는지 로그
             if self.is_mission_paused:
-                self.get_logger().info("🔧 Debug: Vehicle stopped due to mission paused", throttle_duration_sec=5.0)
+                self.get_logger().info("Debug: Vehicle stopped due to mission paused", throttle_duration_sec=5.0)
             self._stop_vehicle()
             return
             
         self._check_waypoint_arrival()
         if self.is_mission_paused or self.is_mission_complete:
             if self.is_mission_paused:
-                self.get_logger().info("🔧 Debug: Mission paused after waypoint check", throttle_duration_sec=2.0)
+                self.get_logger().info("Debug: Mission paused after waypoint check", throttle_duration_sec=2.0)
             return
 
         current_x, current_y, current_yaw = self.vehicle_pose_map
-        goal_idx, lookahead_dist = self._find_goal_point(current_x, current_y)
-        if goal_idx is None or goal_idx >= len(self.full_target_velocities):
+        
+        # Pure Pursuit 컨트롤러를 사용하여 제어 명령 계산
+        cmd_vel, goal_point = self.pursuit_controller.calculate_control_command(
+            (current_x, current_y), current_yaw, self.current_speed,
+            self.full_path_points, self.full_target_velocities, [self.last_closest_idx]
+        )
+        
+        if goal_point is None:
             self._stop_vehicle()
             return
-
-        goal_x, goal_y = self.full_path_points[goal_idx]
-        target_speed = self.full_target_velocities[goal_idx]
-        alpha = math.atan2(goal_y - current_y, goal_x - current_x) - current_yaw
-        effective_speed = max(self.current_speed, 0.1)
-        angular_z = (2.0 * effective_speed * math.sin(alpha)) / lookahead_dist
         
-        twist_msg = Twist()
-        twist_msg.linear.x = float(target_speed)
-        twist_msg.angular.z = float(angular_z)
-        self.cmd_vel_pub.publish(twist_msg)
-        self._publish_lookahead_marker((goal_x, goal_y))
+        self.cmd_vel_pub.publish(cmd_vel)
+        self._publish_lookahead_marker(goal_point)
 
     def _command_input_loop(self):
         """키보드 입력 처리 루프 - 런치 환경 호환성 개선"""
@@ -283,15 +290,15 @@ class PathFollowerNode(Node):
                      self._process_command(cmd)
                 
             except (KeyboardInterrupt, EOFError):
-                self.get_logger().info("🛑 키보드 입력 스레드 종료됨.")
+                self.get_logger().info("키보드 입력 스레드 종료됨.")
                 break
             except Exception as e:
-                self.get_logger().warn(f"⚠️ 입력 처리 중 오류 발생: {e}")
+                self.get_logger().warn(f"입력 처리 중 오류 발생: {e}")
                 import time
                 time.sleep(1) # 오류 발생 시 로그 폭주 방지
 
     def _resume_mission(self):
-        self.get_logger().info("🚀 Switching to high-performance mode (Drone departed).")
+        self.get_logger().info("Switching to high-performance mode (Drone departed).")
         self.current_max_accel = self.MAX_ACCEL_DEFAULT
         self.current_max_jerk = self.MAX_JERK_DEFAULT
 
@@ -301,152 +308,41 @@ class PathFollowerNode(Node):
             self.get_logger().info("No more waypoints. Mission complete.")
             return
             
-        self.main_path_points = self._generate_path_points_from_list(remaining_waypoints)
+        self.main_path_points = self.path_planner.generate_path_from_waypoints(remaining_waypoints)
         self.update_full_path_and_velocity()
         
         self.is_mission_paused = False
         self.is_orienting = True
 
-    def _find_goal_point(self, x, y):
-        closest_idx = self._find_closest_point_idx(x, y)
-        self.last_closest_idx = closest_idx
-        lookahead_dist = np.clip(self.LOOKAHEAD_K * self.current_speed + self.LOOKAHEAD_MIN, self.LOOKAHEAD_MIN, self.LOOKAHEAD_MAX)
-        for i in range(closest_idx, len(self.full_path_points)):
-            if math.hypot(x - self.full_path_points[i][0], y - self.full_path_points[i][1]) >= lookahead_dist:
-                return i, lookahead_dist
-        return len(self.full_path_points) - 1, lookahead_dist
 
-    def _find_closest_point_idx(self, x, y):
-        if not self.full_path_points: return 0
-        search_end = min(self.last_closest_idx + 200, len(self.full_path_points))
-        path_segment = np.array(self.full_path_points[self.last_closest_idx:search_end])
-        if len(path_segment) == 0: return self.last_closest_idx
-        dists = np.linalg.norm(path_segment - np.array([x, y]), axis=1)
-        return self.last_closest_idx + np.argmin(dists)
 
     def _orient_vehicle_for_next_segment(self):
-        closest_idx = self._find_closest_point_idx(self.vehicle_pose_map[0], self.vehicle_pose_map[1])
-        if closest_idx >= len(self.full_path_points) - 1: return True
+        closest_idx = self.pursuit_controller.find_closest_point_idx(
+            (self.vehicle_pose_map[0], self.vehicle_pose_map[1]), self.full_path_points, [self.last_closest_idx]
+        )
+        if closest_idx >= len(self.full_path_points) - 1: 
+            return True
+        
         target_idx = min(closest_idx + int(1.0 / self.PATH_DENSITY), len(self.full_path_points) - 1)
         _, _, current_yaw = self.vehicle_pose_map
         target_x, target_y = self.full_path_points[target_idx]
         target_yaw = math.atan2(target_y - self.vehicle_pose_map[1], target_x - self.vehicle_pose_map[0])
         angle_diff = (target_yaw - current_yaw + math.pi) % (2 * math.pi) - math.pi
+        
         if abs(angle_diff) < math.radians(5.0):
             self._stop_vehicle()
             return True
+        
         twist_msg = Twist()
         twist_msg.angular.z = float(np.clip(angle_diff * 1.5, -1.0, 1.0))
         self.cmd_vel_pub.publish(twist_msg)
         return False
 
-    def _generate_path_points_from_list(self, waypoints):
-        if len(waypoints) < 2: return []
-        wx = [p[0] for p in waypoints]
-        wy = [p[1] for p in waypoints]
-        tck, _ = splprep([wx, wy], s=0, per=False)
-        path_len = np.sum(np.sqrt(np.diff(wx)**2 + np.diff(wy)**2))
-        num_points = max(2, int(path_len / self.PATH_DENSITY))
-        u_fine = np.linspace(0, 1, num_points)
-        x_fine, y_fine = splev(u_fine, tck)
-        return list(zip(x_fine, y_fine))
 
-    def _generate_straight_path(self, start_pos, end_pos):
-        dist = math.hypot(end_pos[0] - start_pos[0], end_pos[1] - start_pos[1])
-        if dist < self.PATH_DENSITY: return []
-        num_points = max(2, int(dist / self.PATH_DENSITY))
-        return list(zip(np.linspace(start_pos[0], end_pos[0], num_points), np.linspace(start_pos[1], end_pos[1], num_points)))
 
-    def _generate_scurve_velocity_profile(self, path_points, start_vel=0.0, end_vel=0.0):
-        if not path_points or len(path_points) < 2: return []
-        num_points = len(path_points)
-        distances = self._calculate_path_distances(path_points)
-        velocity_limits = self._calculate_curvature_limited_velocities([p[0] for p in path_points], [p[1] for p in path_points])
-        
-        # 웨이포인트 기반 속도 제한 적용
-        for i, waypoint in enumerate(self.raw_waypoints):
-            wp_x, wp_y = waypoint[0], waypoint[1]
-            closest_idx = min(range(num_points), key=lambda i: math.hypot(path_points[i][0] - wp_x, path_points[i][1] - wp_y))
-            
-            # 웨이포인트 타입별 속도 설정
-            if len(waypoint) > 3:
-                target_speed = waypoint[3]
-                if len(waypoint) > 2 and waypoint[2] in [2, 4]:  # 정지 지점
-                    wp_vel = 0.0
-                elif target_speed < 0:  # 최대 속도
-                    wp_vel = self.MAX_SPEED
-                else:
-                    wp_vel = np.clip(target_speed, self.MIN_SPEED, self.MAX_SPEED)
-            else:
-                wp_vel = self.MAX_SPEED
-            
-            velocity_limits[closest_idx] = min(velocity_limits[closest_idx], wp_vel)
-        
-        trapezoidal_profile = list(velocity_limits)
-        trapezoidal_profile[0] = float(start_vel)
-        for i in range(1, num_points):
-            ds = distances[i] - distances[i-1]
-            if ds < 1e-6:
-                trapezoidal_profile[i] = trapezoidal_profile[i-1]
-                continue
-            max_reachable_vel = math.sqrt(trapezoidal_profile[i-1]**2 + 2 * self.current_max_accel * ds)
-            trapezoidal_profile[i] = min(trapezoidal_profile[i], max_reachable_vel)
 
-        trapezoidal_profile[-1] = float(end_vel)
-        for i in range(num_points - 2, -1, -1):
-            ds = distances[i+1] - distances[i]
-            if ds < 1e-6:
-                trapezoidal_profile[i] = trapezoidal_profile[i+1]
-                continue
-            max_braking_vel = math.sqrt(trapezoidal_profile[i+1]**2 + 2 * self.MAX_DECEL * ds)
-            trapezoidal_profile[i] = min(trapezoidal_profile[i], max_braking_vel)
-        
-        final_profile = list(trapezoidal_profile)
-        current_accel = 0.0
-        final_profile[0] = float(start_vel)
-        for i in range(1, num_points):
-            ds = distances[i] - distances[i-1]
-            if ds < 1e-6:
-                final_profile[i] = final_profile[i-1]
-                continue
-            v_prev, v_guide = final_profile[i-1], trapezoidal_profile[i]
-            
-            req_accel = (v_guide**2 - v_prev**2) / (2 * ds) if ds > 1e-6 else 0.0
-            lim_accel = np.clip(req_accel, -self.MAX_DECEL, self.current_max_accel)
-            
-            dt = ds / max(v_prev, 0.1)
-            max_accel_change = self.current_max_jerk * dt
-            final_accel = np.clip(lim_accel, current_accel - max_accel_change, current_accel + max_accel_change)
-            
-            v_from_jerk = math.sqrt(max(0, v_prev**2 + 2 * final_accel * ds))
-            final_profile[i] = min(v_from_jerk, trapezoidal_profile[i])
-            current_accel = (final_profile[i]**2 - v_prev**2) / (2 * ds) if ds > 1e-6 else 0.0
-        final_profile[-1] = float(end_vel)
-        return final_profile
     
-    def _calculate_curvature_limited_velocities(self, x, y):
-        curvatures = self._calculate_curvature(x, y)
-        velocities = []
-        for k in curvatures:
-            abs_k = abs(k)
-            if abs_k < 1e-6:
-                max_v = self.MAX_SPEED
-            else:
-                max_v = math.sqrt(self.MAX_LATERAL_ACCEL / abs_k)
-            velocities.append(np.clip(max_v, 0.0, self.MAX_SPEED))
-        return velocities
-    
-    def _calculate_path_distances(self, path_points):
-        distances = [0.0]
-        for i in range(1, len(path_points)):
-            dist = math.hypot(path_points[i][0] - path_points[i-1][0], path_points[i][1] - path_points[i-1][1])
-            distances.append(distances[-1] + dist)
-        return distances
 
-    def _calculate_curvature(self, x, y):
-        dx, dy = np.gradient(x), np.gradient(y)
-        ddx, ddy = np.gradient(dx), np.gradient(dy)
-        return (dx * ddy - dy * ddx) / ((dx**2 + dy**2)**1.5 + 1e-6)
 
     # === [REFACTORED] Visualization Functions ===
     def _publish_path_visualization(self):
@@ -585,105 +481,25 @@ class PathFollowerNode(Node):
         self.lookahead_marker_pub.publish(marker)
 
     def _load_waypoints(self):
-        """웨이포인트 로드 - ROS2 파라미터 또는 파일 또는 기본값"""
+        """웨이포인트 로드 - CSV 파일에서만 로딩"""
         
-        # 1. 먼저 ROS2 파라미터에서 웨이포인트 로드 시도
-        try:
-            waypoints_coords = self.get_parameter('waypoints').value
-            mission_types = self.get_parameter('mission_types').value
-            target_speeds = self.get_parameter('target_speeds').value
+        if not self.waypoint_file:
+            self.get_logger().error("웨이포인트 파일이 지정되지 않음")
+            return None
             
-            if len(waypoints_coords) > 1 and len(waypoints_coords) % 2 == 0:
-                num_waypoints = len(waypoints_coords) // 2
-                
-                # 기본값 설정
-                if len(mission_types) == 0:
-                    mission_types = [1] * num_waypoints
-                if len(target_speeds) == 0:
-                    target_speeds = [-1.0] * num_waypoints
-                    
-                # 웨이포인트 변환 (평면 배열 -> 튜플 형식)
-                waypoints = []
-                for i in range(num_waypoints):
-                    x = float(waypoints_coords[i * 2])
-                    y = float(waypoints_coords[i * 2 + 1])
-                    mission_type = mission_types[i] if i < len(mission_types) else 1
-                    target_speed = target_speeds[i] if i < len(target_speeds) else -1.0
-                    waypoints.append((x, y, mission_type, target_speed))
-                
-                # 웨이포인트 이름 로드 (선택사항)
-                try:
-                    waypoint_names = self.get_parameter('waypoint_names').value
-                    if len(waypoint_names) != num_waypoints:
-                        waypoint_names = [f"wp_{i}" for i in range(num_waypoints)]
-                except:
-                    waypoint_names = [f"wp_{i}" for i in range(num_waypoints)]
-                
-                self.get_logger().info(f"✅ ROS2 파라미터에서 웨이포인트 로드 성공: {num_waypoints}개")
-                self.get_logger().info(f"   - 좌표 수: {len(waypoints_coords)} ({num_waypoints} waypoints)")
-                self.get_logger().info(f"   - 미션 타입: {mission_types}")
-                self.get_logger().info(f"   - 목표 속도: {target_speeds}")
-                return waypoints
-                
+        if not os.path.exists(self.waypoint_file):
+            self.get_logger().error(f"웨이포인트 파일을 찾을 수 없음: {self.waypoint_file}")
+            return None
+            
+        try:
+            waypoints = self._load_waypoints_from_csv(self.waypoint_file)
+            self.get_logger().info(f"웨이포인트 파일 로드 성공: {self.waypoint_file}")
+            return waypoints
         except Exception as e:
-            self.get_logger().info(f"ROS2 파라미터에서 웨이포인트 로드 실패: {e}")
-        
-        # 2. 파일에서 로드 시도
-        if self.waypoint_file:
-            try:
-                waypoints = self._load_waypoints_from_file(self.waypoint_file)
-                if waypoints:
-                    self.get_logger().info(f"✅ 웨이포인트 파일 로드 성공: {self.waypoint_file}")
-                    return waypoints
-                else:
-                    self.get_logger().warn(f"⚠️ 웨이포인트 파일이 비어있음: {self.waypoint_file}")
-            except Exception as e:
-                self.get_logger().error(f"❌ 웨이포인트 파일 로드 실패: {e}")
-                self.get_logger().info("기본 웨이포인트 사용")
-        
-        # 3. 기본 웨이포인트 반환
-        self.get_logger().info("🔄 기본 웨이포인트 사용")
-        return [
-            (-130.04, 51.88, 1, -1.0),
-            (-132.71, 58.04, 1, -1.0),
-            (-132.87, 64.00, 2, 0.0),  # 드론 이륙 지점
-            (-129.23, 69.36, 3, -1.0), (-120.85, 73.20, 3, -1.0), (-117.45, 73.15, 3, -1.0),
-            (-113.63, 72.64, 3, -1.0), (-104.97, 77.01, 3, -1.0), (-94.75, 84.41, 3, -1.0),
-            (-91.71, 86.98, 3, -1.0), (-80.82, 97.95, 3, -1.0), (-76.74, 99.61, 3, 1.0),
-            (-73.90, 98.63, 3, 1.0), (-72.13, 98.65, 3, 1.0), (-62.96, 99.09, 4, 0.0)  # 최종 목적지
-        ]
+            self.get_logger().error(f"웨이포인트 파일 로드 실패: {e}")
+            return None
 
-    def _load_waypoints_from_file(self, file_path):
-        """파일에서 웨이포인트 로드 (YAML 또는 CSV)"""
-        if not os.path.exists(file_path):
-            raise FileNotFoundError(f"파일을 찾을 수 없습니다: {file_path}")
-        
-        _, ext = os.path.splitext(file_path.lower())
-        
-        if ext == '.yaml' or ext == '.yml':
-            return self._load_waypoints_from_yaml(file_path)
-        elif ext == '.csv':
-            return self._load_waypoints_from_csv(file_path)
-        else:
-            raise ValueError(f"지원하지 않는 파일 형식: {ext}")
 
-    def _load_waypoints_from_yaml(self, file_path):
-        """YAML 파일에서 웨이포인트 로드"""
-        with open(file_path, 'r') as f:
-            data = yaml.safe_load(f)
-        
-        if 'waypoints' not in data:
-            raise ValueError("YAML 파일에 'waypoints' 키가 없습니다")
-        
-        waypoints = []
-        for wp in data['waypoints']:
-            x = float(wp['x'])
-            y = float(wp['y'])
-            mission_type = wp.get('mission_type', 1)
-            target_speed = wp.get('target_speed', -1.0)
-            waypoints.append((x, y, mission_type, target_speed))
-        
-        return waypoints
 
     def _load_waypoints_from_csv(self, file_path):
         """CSV 파일에서 웨이포인트 로드 - 새로운 waypoint_parser 유틸리티 사용"""
@@ -695,11 +511,11 @@ class PathFollowerNode(Node):
                 # WaypointData 객체를 튜플 형태로 변환
                 waypoints.append(wp_data.to_tuple())
             
-            self.get_logger().info(f"✅ CSV 파서를 사용하여 {len(waypoints)}개 웨이포인트 로드 완료")
+            self.get_logger().info(f"CSV 파서를 사용하여 {len(waypoints)}개 웨이포인트 로드 완료")
             return waypoints
             
         except Exception as e:
-            self.get_logger().error(f"❌ CSV 파싱 오류: {e}")
+            self.get_logger().error(f"CSV 파싱 오류: {e}")
             raise
 
     def _quat_to_euler(self, q):
@@ -720,7 +536,7 @@ class PathFollowerNode(Node):
             return
 
         goal_x, goal_y = self.main_path_points[0]
-        initial_path = self._generate_straight_path((start_x, start_y), (goal_x, goal_y))
+        initial_path = self.path_planner._generate_straight_path((start_x, start_y), (goal_x, goal_y))
         
         self.full_path_points = initial_path + self.main_path_points
         
@@ -728,8 +544,14 @@ class PathFollowerNode(Node):
         final_waypoint = self.raw_waypoints[-1]
         end_vel = 0.0 if len(final_waypoint) > 2 and final_waypoint[2] == 4 else 0.0  # 안전을 위해 항상 0으로 종료
         
-        self.full_target_velocities = self._generate_scurve_velocity_profile(
-            self.full_path_points, start_vel=self.current_speed, end_vel=end_vel)
+        # 새로운 모듈을 사용하여 속도 프로파일 생성
+        distances = self.path_planner.calculate_path_distances(self.full_path_points)
+        curvatures = self.path_planner.calculate_curvature(self.full_path_points)
+        self.full_target_velocities = self.velocity_profiler.generate_scurve_profile(
+            self.full_path_points, distances, curvatures, self.raw_waypoints, 
+            start_vel=self.current_speed, end_vel=end_vel
+        )
+        
         self._publish_path_visualization()
 
     def _check_waypoint_arrival(self):
@@ -747,21 +569,21 @@ class PathFollowerNode(Node):
         
         # 특정 웨이포인트에서만 디버깅 로그 출력
         if self.current_waypoint_idx == 2:
-            self.get_logger().info(f"🔍 Debug: WP{self.current_waypoint_idx} 거리체크 - 현재위치:({self.vehicle_pose_map[0]:.2f}, {self.vehicle_pose_map[1]:.2f}), 목표:({wp_x:.2f}, {wp_y:.2f}), 거리:{dist:.2f}m, 임계값:{self.REACH_THRESHOLD}m", throttle_duration_sec=2.0)
+            self.get_logger().info(f"Debug: WP{self.current_waypoint_idx} 거리체크 - 현재위치:({self.vehicle_pose_map[0]:.2f}, {self.vehicle_pose_map[1]:.2f}), 목표:({wp_x:.2f}, {wp_y:.2f}), 거리:{dist:.2f}m, 임계값:{self.REACH_THRESHOLD}m", throttle_duration_sec=2.0)
         
         if dist < self.REACH_THRESHOLD:
-            self.get_logger().info(f"✅ Waypoint {self.current_waypoint_idx} reached (distance: {dist:.2f}m).")
+            self.get_logger().info(f"Waypoint {self.current_waypoint_idx} reached (distance: {dist:.2f}m)")
             
             # 특정 웨이포인트에서만 처리 (기존 로직 유지)
             if len(waypoint) > 2:  # 미션 타입 정보가 있는 경우
                 mission_type = waypoint[2]
                 if mission_type == 2:  # 드론 이륙 지점
                     self.is_mission_paused = True
-                    self.get_logger().info("🚁 Drone takeoff point reached. Vehicle paused.")
-                    self.get_logger().info(f"🔧 Debug: is_mission_paused set to {self.is_mission_paused}")
+                    self.get_logger().info("Drone takeoff point reached. Vehicle paused.")
+                    self.get_logger().info(f"Debug: is_mission_paused set to {self.is_mission_paused}")
                 elif mission_type == 4:  # 최종 목적지
                     self.is_mission_complete = True
-                    self.get_logger().info("🏁 Mission completed!")
+                    self.get_logger().info("Mission completed!")
             
             # 미션 완료 신호 전송 (매핑 테이블 사용)
             if self.current_waypoint_idx in self.waypoint_mission_mapping:
@@ -769,7 +591,6 @@ class PathFollowerNode(Node):
                 self.send_mission_complete(mission_id)
             
             self.current_waypoint_idx += 1
-            self.last_closest_idx = self._find_closest_point_idx(self.vehicle_pose_map[0], self.vehicle_pose_map[1])
 
 def main(args=None):
     rclpy.init(args=args)
@@ -777,7 +598,7 @@ def main(args=None):
     try:
         rclpy.spin(node)
     except (KeyboardInterrupt, SystemExit):
-        node.get_logger().info("🛑 Shutting down...")
+        node.get_logger().info("Shutting down...")
     finally:
         node.destroy_node()
         rclpy.shutdown()

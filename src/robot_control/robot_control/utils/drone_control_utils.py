@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 드론 제어 관련 유틸리티 함수 모음
-PX4 오프보드 제어, 짐벌 제어, 좌표 변환 등의 공통 기능을 제공합니다.
+PX4 오프보드 제어, 짐벌 제어, 좌표 변환 등의 공통 기능을 제공
 """
 
 import math
@@ -130,8 +130,8 @@ def publish_vehicle_command(node, command, **kwargs):
 
 def publish_offboard_control_mode(node):
     """
-    Offboard 제어 모드 메시지를 퍼블리시합니다.
-    Position 제어 모드로 설정됩니다.
+    Offboard 제어 모드 메시지를 퍼블리시
+    Position 제어 모드로 설정됨
     """
     msg = OffboardControlMode(
         position=True,
@@ -228,7 +228,7 @@ def convert_map_to_local_setpoint(current_local_pos, current_map_pose, target_ma
 
 def publish_position_setpoint(node, current_local_pos, current_map_pose, target_map_pos, target_yaw_deg=None):
     """
-    Map 좌표계 목표 위치를 기반으로 TrajectorySetpoint를 퍼블리시합니다.
+    Map 좌표계 목표 위치를 기반으로 TrajectorySetpoint를 퍼블리시
     
     Args:
         node: ROS2 노드 인스턴스

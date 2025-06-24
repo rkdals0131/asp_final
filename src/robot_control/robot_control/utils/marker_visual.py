@@ -11,7 +11,7 @@ import math
 class MarkerVisualNode(Node):
     """
     /marker_detections 토픽을 구독하여 마커 정보를 저장하고 시각화하며, 
-    Ground Truth 마커도 함께 시각화합니다.
+    Ground Truth 마커도 함께 시각화
     """
     def __init__(self):
         super().__init__('marker_visual_node')
@@ -59,8 +59,8 @@ class MarkerVisualNode(Node):
 
     def euler_to_quaternion(self, roll, pitch, yaw):
         """
-        오일러 각도(roll, pitch, yaw)를 쿼터니언으로 변환합니다.
-        Extrinsic ZYX (Yaw-Pitch-Roll) 순서로 변환하여 적용합니다.
+            오일러 각도(roll, pitch, yaw)를 쿼터니언으로 변환
+    Extrinsic ZYX (Yaw-Pitch-Roll) 순서로 변환하여 적용
         """
         cy = math.cos(yaw * 0.5)
         sy = math.sin(yaw * 0.5)
@@ -79,8 +79,8 @@ class MarkerVisualNode(Node):
 
     def load_ground_truth_markers(self, csv_path):
         """
-        Ground Truth 마커 정보를 CSV 파일에서 로드합니다.
-        CSV의 roll, pitch, yaw 값을 포함하여 전체 포즈를 사용합니다.
+            Ground Truth 마커 정보를 CSV 파일에서 로드
+    CSV의 roll, pitch, yaw 값을 포함하여 전체 포즈를 사용
         """
         # 절대 경로 또는 상대 경로 처리
         if not os.path.isabs(csv_path):
@@ -127,7 +127,7 @@ class MarkerVisualNode(Node):
 
     def detection_callback(self, msg: Detection3DArray):
         """
-        /marker_detections 토픽 메시지를 처리합니다.
+        /marker_detections 토픽 메시지를 처리
         """
         current_marker_ids = set()
         
@@ -156,7 +156,7 @@ class MarkerVisualNode(Node):
 
     def publish_ground_truth_markers(self):
         """
-        Ground Truth 마커만 발행합니다.
+        Ground Truth 마커만 발행
         """
         if not self.show_ground_truth:
             return
@@ -267,7 +267,7 @@ class MarkerVisualNode(Node):
 
     def save_to_csv(self):
         """
-        노드 종료 시 탐지된 마커 정보를 CSV 파일로 저장합니다.
+        노드 종료 시 탐지된 마커 정보를 CSV 파일로 저장
         """
         if not self.stored_markers:
             self.get_logger().info("No detected markers to save.")
