@@ -19,7 +19,7 @@ rviz2 실행, rviz의 config는 같은 폴더의 asp final proj 사용
 ros2 launch multi_tracker x500_aruco_detector.launch.py
 
 # 터미널 6
-ros2 run robot_control marker_visual_node   
+ros2 run robot_control detected_marker_visualizer 
 
 # 터미널 7
 ros2 launch robot_control ugv_mission.launch.py  

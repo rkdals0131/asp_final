@@ -220,7 +220,7 @@ def create_ground_truth_markers(header: Header, ground_truth_data: dict) -> Mark
         pose.orientation.z = position['qz']
         pose.orientation.w = position['qw']
         
-        scale = Vector3(x=0.5, y=0.5, z=0.5)
+        scale = Vector3(x=3.0, y=3.0, z=3.0) # 반경 1.5m
         color = ColorRGBA(r=0.0, g=1.0, b=1.0, a=0.3) # 청록색, 반투명
         
         marker = create_base_marker(header, "ground_truth_markers", marker_id, Marker.SPHERE, pose, scale, color)
@@ -234,18 +234,18 @@ def create_detected_markers(header: Header, stored_markers: dict, current_marker
     for marker_id_str, pose in stored_markers.items():
         marker_id = int(marker_id_str)
         
-        scale = Vector3(x=1.0, y=1.0, z=0.1)
+        scale = Vector3(x=0.5, y=0.5, z=0.5)
         
         color = ColorRGBA()
         if marker_id_str in current_marker_ids:
-            # 현재 프레임에 탐지된 마커: 밝은 노란색
-            color.r, color.g, color.b, color.a = 1.0, 1.0, 0.3, 1.0
+            # 현재 프레임에 탐지된 마커: 불투명 핑크색
+            color.r, color.g, color.b, color.a = 1.0, 0.0, 1.0, 1.0
         else:
             # 이전 프레임에서 탐지된 마커: 어두운 노란색
             color.r, color.g, color.b, color.a = 0.8, 0.8, 0.0, 0.8
 
         # ID 충돌 방지를 위해 100을 더함
-        marker = create_base_marker(header, "detected_markers", marker_id + 100, Marker.CUBE, pose, scale, color)
+        marker = create_base_marker(header, "detected_markers", marker_id + 100, Marker.SPHERE, pose, scale, color)
         marker_array.markers.append(marker)
         
     return marker_array

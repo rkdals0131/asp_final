@@ -53,12 +53,12 @@ class WaypointMissionNode(BaseMissionNode):
         
         # 정밀 착륙 관련 변수 및 파라미터
         self.declare_parameter('landing_altitude', 0.5)
-        self.declare_parameter('descent_speed', 7.0, 
+        self.declare_parameter('descent_speed', 10.0, 
             ParameterDescriptor(description="마커 정렬 후 최종 착륙 시 하강 속도 (m/s)"))
         self.declare_parameter('horizontal_tolerance', 0.15)
         self.declare_parameter('vertical_tolerance', 0.3)
         self.declare_parameter('landing_marker_id', 6)  # 착륙용 마커 ID
-        self.declare_parameter('search_descent_speed', 7.0, 
+        self.declare_parameter('search_descent_speed', 10.0, 
             ParameterDescriptor(description="마커를 탐색하며 하강할 때의 속도 (m/s)"))
         self.declare_parameter('precision_horizontal_tolerance', 0.1)  # 정밀 착륙 시 수평 허용 오차
         
@@ -224,11 +224,40 @@ class WaypointMissionNode(BaseMissionNode):
         waypoints = self.drone_waypoints.tolist()
         if len(waypoints) > 1:
             path_header = self._create_header("map")
-            path_marker = visu.create_mission_path_marker(
-                header=path_header,
-                waypoints=waypoints
-            )
-            marker_array.markers.append(path_marker)
+            current_idx = self.current_waypoint_index
+
+            # 남은 경로 (연한 초록색)
+            if current_idx < len(waypoints):
+                future_waypoints = waypoints[current_idx:]
+                if len(future_waypoints) > 1:
+                    future_path = visu.create_mission_path_marker(
+                        header=path_header, waypoints=future_waypoints,
+                        color=(0.1, 1.0, 0.1), alpha=0.2,
+                        ns="future_path", marker_id=1)
+                    marker_array.markers.append(future_path)
+
+            # 현재 활성 경로 (진한 초록색)
+            if 0 < current_idx < len(waypoints):
+                active_waypoints = waypoints[current_idx-1:current_idx+1]
+                active_path = visu.create_mission_path_marker(
+                    header=path_header, waypoints=active_waypoints,
+                    color=(0.1, 1.0, 0.1), alpha=0.8,
+                    ns="active_path", marker_id=2)
+                marker_array.markers.append(active_path)
+            elif current_idx == 0 and len(waypoints) > 0:
+                # 이륙 후 첫 웨이포인트로 가는 경로는 아직 '활성'으로 표시하지 않음
+                pass
+
+            # 지나온 경로 (연한 회색)
+            if current_idx > 0:
+                # +1을 하여 현재 웨이포인트까지 포함시켜야 이전 경로가 그려짐
+                passed_waypoints = waypoints[:current_idx]
+                if len(passed_waypoints) > 1:
+                    passed_path = visu.create_mission_path_marker(
+                        header=path_header, waypoints=passed_waypoints,
+                        color=(0.5, 0.5, 0.5), alpha=0.4,
+                        ns="passed_path", marker_id=3)
+                    marker_array.markers.append(passed_path)
 
         # 2. 웨이포인트 시각화
         for i, wp in enumerate(waypoints):
