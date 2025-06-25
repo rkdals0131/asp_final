@@ -40,6 +40,7 @@ setup(
             'mission_control_node = robot_control.admin.mission_control_node:main',
             'interactive_mission = robot_control.uav.interactive_mission:main',
             'waypoint_mission = robot_control.uav.waypoint_mission:main',
+            'advanced_waypoint_mission = robot_control.uav.advanced_waypoint_mission:main',
             'path_follower_node = robot_control.ugv.path_follower_node:main',
             'path_planner = robot_control.ugv.path_planner:main',
             'detected_marker_visualizer = robot_control.uav.detected_marker_visualizer:main',

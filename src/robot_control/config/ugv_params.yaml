@@ -4,15 +4,15 @@ path_follower_node:
     use_mission_ids: true
     
     # === 차량 동역학 파라미터 ===
-    max_jerk_with_drone: 1.0          # 드론 탑재 시 최대 저크 (m/s³)
-    max_jerk_default: 3.0             # 기본 최대 저크 (m/s³)
+    max_jerk_with_drone: 2.0          # 드론 탑재 시 최대 저크 (m/s³)
+    max_jerk_default: 4.0             # 기본 최대 저크 (m/s³)
     max_accel_with_drone: 0.5         # 드론 탑재 시 최대 가속도 (m/s²)
-    max_accel_default: 2.0            # 기본 최대 가속도 (m/s²)
+    max_accel_default: 4.0            # 기본 최대 가속도 (m/s²)
     max_decel: 1.0                    # 최대 감속도 (m/s²)
-    max_lateral_accel: 2.0            # 최대 횡방향 가속도 (m/s²)
+    max_lateral_accel: 2.5            # 최대 횡방향 가속도 (m/s²)
     
     # === 속도 제한 ===
-    max_speed: 6.0                    # 최대 주행 속도 (m/s)
+    max_speed: 7.0                    # 최대 주행 속도 (m/s)
     min_speed: 0.5                    # 최소 주행 속도 (m/s)
     default_speed: 3.0                # 기본 속도 (m/s)
     

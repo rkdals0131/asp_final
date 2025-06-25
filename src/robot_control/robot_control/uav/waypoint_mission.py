@@ -53,12 +53,12 @@ class WaypointMissionNode(BaseMissionNode):
         
         # 정밀 착륙 관련 변수 및 파라미터
         self.declare_parameter('landing_altitude', 0.5)
-        self.declare_parameter('descent_speed', 10.0, 
+        self.declare_parameter('descent_speed', 7.0, 
             ParameterDescriptor(description="마커 정렬 후 최종 착륙 시 하강 속도 (m/s)"))
         self.declare_parameter('horizontal_tolerance', 0.15)
         self.declare_parameter('vertical_tolerance', 0.3)
-        self.declare_parameter('landing_marker_id', 6)  # 착륙용 마커 ID
-        self.declare_parameter('search_descent_speed', 10.0, 
+        self.declare_parameter('landing_marker_id', 10)  # 착륙용 마커 ID
+        self.declare_parameter('search_descent_speed', 7.0, 
             ParameterDescriptor(description="마커를 탐색하며 하강할 때의 속도 (m/s)"))
         self.declare_parameter('precision_horizontal_tolerance', 0.1)  # 정밀 착륙 시 수평 허용 오차
         

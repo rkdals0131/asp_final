@@ -34,15 +34,15 @@ class PathFollowerNode(Node):
         super().__init__('path_follower_node')
 
         # === 핵심 파라미터 ===
-        self.declare_parameter('max_jerk_with_drone', 1.0)
-        self.declare_parameter('max_jerk_default', 3.0)
-        self.declare_parameter('max_accel_with_drone', 0.5)
-        self.declare_parameter('max_accel_default', 2.0)
+        self.declare_parameter('max_jerk_with_drone', 2.0)
+        self.declare_parameter('max_jerk_default', 4.0)
+        self.declare_parameter('max_accel_with_drone', 1.0)
+        self.declare_parameter('max_accel_default', 4.0)
 
-        self.declare_parameter('lookahead_k', 2.0)
+        self.declare_parameter('lookahead_k', 0.9)
         self.declare_parameter('lookahead_min', 0.5)
         self.declare_parameter('lookahead_max', 3.0)
-        self.declare_parameter('max_speed', 6.0)
+        self.declare_parameter('max_speed', 7.0)
         self.declare_parameter('min_speed', 0.5)
         self.declare_parameter('max_decel', 1.0)
         self.declare_parameter('max_lateral_accel', 2.0)
@@ -410,10 +410,25 @@ class PathFollowerNode(Node):
             self.get_logger().warn("Main path is empty, cannot generate full path.")
             return
 
-        goal_x, goal_y = self.main_path_points[0]
-        initial_path = self.path_planner._generate_straight_path((start_x, start_y), (goal_x, goal_y))
-        
-        self.full_path_points = initial_path + self.main_path_points
+        # === 변경 사항 ===
+        # 스폰(현재) 위치를 웨이포인트 리스트의 첫 요소로 삽입하여
+        # PathPlanner.generate_path_from_waypoints()를 한 번만 호출한다.
+        # 이렇게 하면 직선-스플라인 접속부의 곡률 급증 현상을 완화할 수 있다.
+
+        # 1) 현재 위치를 임시 웨이포인트로 구성 (mission_type=1, target_speed=-1.0은 무시돼도 무방)
+        spawn_wp = (start_x, start_y, 1, -1.0)
+
+        # 2) 아직 방문하지 않은 웨이포인트만 추출하여 앞에 붙인다
+        remaining_waypoints = self.raw_waypoints[self.current_waypoint_idx:]
+
+        # 3) PathPlanner에 전달할 좌표 (x, y) 튜플 리스트 생성
+        planning_wps_xy = [(spawn_wp[0], spawn_wp[1])] + [(wp[0], wp[1]) for wp in remaining_waypoints]
+
+        # 4) 스플라인 경로 생성
+        self.full_path_points = self.path_planner.generate_path_from_waypoints(planning_wps_xy)
+
+        # 새 경로가 생성되었으므로 last_closest_idx 초기화 (방어 코드)
+        self.last_closest_idx = 0
         
         final_waypoint = self.raw_waypoints[-1]
         end_vel = 0.0 if len(final_waypoint) > 2 and final_waypoint[2] == 4 else 0.0

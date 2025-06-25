@@ -54,7 +54,7 @@ class DetectedMarkerVisualizer(Node):
             pose = detection.results[0].pose.pose
             
             try:
-                if not (0 <= int(marker_id) <= 6):
+                if not (0 <= int(marker_id) <= 10):
                     self.get_logger().warn(f"Invalid marker ID '{marker_id}'. Skipping.")
                     continue
             except ValueError:

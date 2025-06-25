@@ -128,16 +128,21 @@ def publish_vehicle_command(node, command, **kwargs):
     node.vehicle_command_publisher.publish(msg)
 
 
-def publish_offboard_control_mode(node):
+def publish_offboard_control_mode(node, position=True, velocity=False, acceleration=False):
     """
     Offboard 제어 모드 메시지를 퍼블리시
-    Position 제어 모드로 설정됨
+    Args:
+        node: ROS2 노드 인스턴스
+        position (bool): 위치 제어 활성화 여부
+        velocity (bool): 속도 제어 활성화 여부
+        acceleration (bool): 가속도 제어 활성화 여부
     """
     msg = OffboardControlMode(
-        position=True,
-        velocity=False,
-        acceleration=False,
+        position=position,
+        velocity=velocity,
+        acceleration=acceleration,
         attitude=False,
+        body_rate=False, # 추가: body_rate는 사용하지 않으므로 명시적으로 False 설정
         timestamp=int(node.get_clock().now().nanoseconds / 1000)
     )
     node.offboard_control_mode_publisher.publish(msg)
@@ -226,57 +231,80 @@ def convert_map_to_local_setpoint(current_local_pos, current_map_pose, target_ma
     return [float(target_ned_x), float(target_ned_y), float(target_ned_z)]
 
 
-def publish_position_setpoint(node, current_local_pos, current_map_pose, target_map_pos, target_yaw_deg=None):
+def publish_position_setpoint(node, target_map_pos, target_yaw_deg=None):
     """
-    Map 좌표계 목표 위치를 기반으로 TrajectorySetpoint를 퍼블리시
+    Map 좌표계 목표 위치를 기반으로 TrajectorySetpoint를 퍼블리시 (위치 제어 전용)
     
     Args:
         node: ROS2 노드 인스턴스
-        current_local_pos: 현재 드론의 local 위치
-        current_map_pose: 현재 드론의 map 위치
         target_map_pos: 목표 지점의 map 좌표 [x, y, z]
         target_yaw_deg: 목표 yaw 각도 (도 단위, 맵 좌표계 기준, None이면 yaw 제어 안함)
     """
-    if current_map_pose is None or current_local_pos is None:
-        return
-    
-    # 임시 target_map_pose 생성
-    target_map_pose = PoseStamped()
-    target_map_pose.pose.position.x = target_map_pos[0]
-    target_map_pose.pose.position.y = target_map_pos[1] 
-    target_map_pose.pose.position.z = target_map_pos[2]
-    
-    # Local NED 좌표로 변환
-    target_ned = convert_map_to_local_setpoint(current_local_pos, current_map_pose, target_map_pose)
-    
-    # Yaw 처리
-    yaw_value = math.nan  # 기본값: yaw 제어 안함
-    if target_yaw_deg is not None:
-        # 맵 좌표계 yaw를 PX4 yaw로 변환하고 라디안으로 변환
-        px4_yaw_deg = map_yaw_to_px4_yaw_degrees(target_yaw_deg)
-        yaw_value = degrees_to_radians(px4_yaw_deg)
-    
-    # TrajectorySetpoint 메시지 생성 및 퍼블리시
-    sp_msg = TrajectorySetpoint(
-        position=target_ned,
-        yaw=yaw_value,
-        timestamp=int(node.get_clock().now().nanoseconds / 1000)
-    )
-    node.trajectory_setpoint_publisher.publish(sp_msg)
+    publish_trajectory_setpoint(node, 
+                                target_map_pos=target_map_pos, 
+                                target_yaw_deg=target_yaw_deg)
 
 
-def publish_position_setpoint_with_yaw(node, current_local_pos, current_map_pose, target_map_pos, target_yaw_deg):
+def publish_trajectory_setpoint(node, target_map_pos=None, target_map_vel=None, target_yaw_deg=None):
     """
-    Yaw 제어가 포함된 position setpoint를 퍼블리시합니다.
+    Map 좌표계 기준 목표 위치/속도를 기반으로 TrajectorySetpoint을 퍼블리시.
+    이 함수는 위치, 속도, yaw 제어를 위한 모든 로직을 통합.
     
     Args:
         node: ROS2 노드 인스턴스
-        current_local_pos: 현재 드론의 local 위치
-        current_map_pose: 현재 드론의 map 위치
-        target_map_pos: 목표 지점의 map 좌표 [x, y, z]
-        target_yaw_deg: 목표 yaw 각도 (도 단위, 맵 좌표계 기준)
+        target_map_pos (list, optional): 목표 map 좌표 [x, y, z]
+        target_map_vel (list, optional): 목표 map 속도 [vx, vy, vz]
+        target_yaw_deg (float, optional): 목표 yaw 각도 (도 단위, 맵 좌표계 기준)
     """
-    publish_position_setpoint(node, current_local_pos, current_map_pose, target_map_pos, target_yaw_deg)
+    if node.current_map_pose is None or node.current_local_pos is None:
+        node.get_logger().warn("위치 정보가 없어 setpoint를 발행할 수 없습니다.", throttle_duration_sec=2.0)
+        return
+
+    sp_msg = TrajectorySetpoint()
+    sp_msg.timestamp = int(node.get_clock().now().nanoseconds / 1000)
+    
+    # 제어 모드 결정
+    use_pos = target_map_pos is not None
+    use_vel = target_map_vel is not None
+    publish_offboard_control_mode(node, position=use_pos, velocity=use_vel)
+
+    # 위치 설정 (map -> local NED 변환)
+    if use_pos:
+        # 임시 target_map_pose 생성
+        temp_target_map_pose = PoseStamped()
+        temp_target_map_pose.pose.position.x = float(target_map_pos[0])
+        temp_target_map_pose.pose.position.y = float(target_map_pos[1])
+        temp_target_map_pose.pose.position.z = float(target_map_pos[2])
+        
+        target_ned_pos = convert_map_to_local_setpoint(
+            node.current_local_pos, node.current_map_pose, temp_target_map_pose)
+        
+        sp_msg.position = target_ned_pos
+    else:
+        sp_msg.position = [float('nan'), float('nan'), float('nan')]
+
+    # 속도 설정 (map(ENU) -> local NED 변환)
+    if use_vel:
+        # ENU to NED 변환 적용
+        sp_msg.velocity[0] = float(target_map_vel[1])  # North = ENU_Y
+        sp_msg.velocity[1] = float(target_map_vel[0])  # East  = ENU_X
+        sp_msg.velocity[2] = float(-target_map_vel[2]) # Down  = -ENU_Z
+    else:
+        sp_msg.velocity = [float('nan'), float('nan'), float('nan')]
+
+    # Yaw 설정 (map -> PX4 NED 변환)
+    if target_yaw_deg is not None:
+        px4_yaw_rad = degrees_to_radians(map_yaw_to_px4_yaw_degrees(target_yaw_deg))
+        sp_msg.yaw = normalize_angle_radians(px4_yaw_rad)
+    else:
+        # Yaw 제어를 원하지 않을 경우, 현재 드론의 yaw를 유지하도록 설정
+        # 이렇게 하면 위치/속도 제어 시 yaw가 의도치 않게 변경되는 것을 방지
+        if node.current_local_pos and hasattr(node.current_local_pos, 'heading'):
+             sp_msg.yaw = node.current_local_pos.heading
+        else:
+             sp_msg.yaw = float('nan')
+
+    node.trajectory_setpoint_publisher.publish(sp_msg)
 
 
 def check_arrival(current_map_pose, target_pos, tolerance=2.0):
@@ -296,19 +324,24 @@ def check_arrival(current_map_pose, target_pos, tolerance=2.0):
     
     pos = current_map_pose.pose.position
     
-    # target_pos가 list인지 PoseStamped인지 확인
-    if isinstance(target_pos, list):
-        target_x, target_y, target_z = target_pos
+    # target_pos가 PoseStamped인 경우와 list인 경우 모두 처리
+    if isinstance(target_pos, PoseStamped):
+        target_point = target_pos.pose.position
+    elif isinstance(target_pos, list) and len(target_pos) == 3:
+        target_point = type('obj', (object,), {'x': target_pos[0], 'y': target_pos[1], 'z': target_pos[2]})()
     else:
-        target_x = target_pos.pose.position.x
-        target_y = target_pos.pose.position.y
-        target_z = target_pos.pose.position.z
+        # 잘못된 타입의 target_pos가 들어오면 False 반환
+        return False
+
+    dx = current_map_pose.pose.position.x - target_point.x
+    dy = current_map_pose.pose.position.y - target_point.y
+    dz = current_map_pose.pose.position.z - target_point.z
     
     # 3D 거리 계산
     distance = math.sqrt(
-        (pos.x - target_x)**2 + 
-        (pos.y - target_y)**2 + 
-        (pos.z - target_z)**2
+        (dx)**2 + 
+        (dy)**2 + 
+        (dz)**2
     )
     
     return distance < tolerance
