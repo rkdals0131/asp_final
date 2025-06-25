@@ -1,0 +1,34 @@
+# Preliminaries
+pip install setuptools==58.2.0
+pip install numpy==1.26.4
+colcon build --symlink-install 빌드, 환경 활성화(source install/setup.bash)
+
+# 터미널 1
+px4 실행
+
+# 터미널 2
+qgc 실행
+
+# 터미널 3
+ros2 launch gazebo_env_setup combined_launch.py
+
+# 터미널 4
+rviz2 실행, rviz의 config는 같은 폴더의 asp final proj 사용
+
+# 터미널 5
+ros2 launch multi_tracker x500_aruco_detector.launch.py
+
+# 터미널 6
+ros2 run robot_control marker_visual_node   
+
+# 터미널 7
+ros2 launch robot_control ugv_mission.launch.py  
+
+# 터미널 8
+ros2 run robot_control waypoint_mission 
+
+# 터미널 9
+ros2 run robot_control mission_control_node 
+
+# 터미널 10
+ros2 run robot_control dashboard_node
