@@ -12,10 +12,12 @@ import math
 
 from px4_msgs.msg import VehicleLandDetected, GimbalDeviceAttitudeStatus, VehicleCommand, TrajectorySetpoint
 from geometry_msgs.msg import PoseStamped
+from std_msgs.msg import Header
+from visualization_msgs.msg import Marker, MarkerArray
 
 from .base_mission_node import BaseMissionNode
-from ..utils import drone_control_utils as dcu
-from ..utils import visualization_utils as visu
+from robot_control.utils import drone_control_utils as dcu
+from ..utils import viz_factory as visu
 
 
 class InteractiveMissionNode(BaseMissionNode):
@@ -396,15 +398,74 @@ class InteractiveMissionNode(BaseMissionNode):
             self.get_logger().error("각도 값이 잘못되었습니다. 숫자를 입력하세요.")
     
 
-            # 시각화
+    # 시각화
+
+    def _create_header(self, frame_id: str) -> Header:
+        """지정된 frame_id로 ROS 메시지 헤더를 생성합니다."""
+        header = Header()
+        header.stamp = self.get_clock().now().to_msg()
+        header.frame_id = frame_id
+        return header
     
     def _publish_all_markers(self):
         """모든 웨이포인트와 주시 타겟 위치에 마커를 게시합니다."""
-        marker_array = visu.create_interactive_mission_markers(
-            self, self.drone_waypoints.tolist(), self.stare_targets, self.final_destination
-        )
+        marker_array = MarkerArray()
+
+        # 0. 이전 마커 모두 삭제
+        delete_marker = Marker(action=Marker.DELETEALL)
+        marker_array.markers.append(delete_marker)
+
+        # 1. 드론 웨이포인트 시각화 (경로 + 마커)
+        waypoints = self.drone_waypoints.tolist()
+        if len(waypoints) > 1:
+            path_header = self._create_header("map")
+            path_marker = visu.create_mission_path_marker(
+                header=path_header,
+                waypoints=waypoints
+            )
+            marker_array.markers.append(path_marker)
+        
+        for i, wp in enumerate(waypoints):
+            wp_header = self._create_header("map")
+            # 인터랙티브 미션에서는 'current' 상태가 없으므로 'future'로 통일
+            waypoint_markers = visu.create_waypoint_visual(
+                header=wp_header,
+                waypoint_id=i,
+                position=wp,
+                waypoint_status="future",
+                text_label=f"WP {i}"
+            )
+            marker_array.markers.extend(waypoint_markers)
+            
+        # 2. 주시 타겟(Stare Target) 시각화
+        for i, target in enumerate(self.stare_targets):
+            target_header = self._create_header("map")
+            # 현재 stare 중인 타겟 강조
+            color = (1.0, 0.0, 0.0) if i == self.stare_target_index else (1.0, 0.5, 0.0)
+            
+            target_markers = visu.create_target_visual(
+                header=target_header,
+                target_id=i,
+                position=target,
+                color=color,
+                text_label=f"Stare {i}"
+            )
+            marker_array.markers.extend(target_markers)
+
+        # 3. 최종 목적지(Final Destination) 시각화 (stare_targets와 겹칠 수 있지만 강조)
+        if self.final_destination is not None:
+             final_dest_header = self._create_header("map")
+             final_dest_markers = visu.create_target_visual(
+                 header=final_dest_header,
+                 target_id=999, # 중복 방지를 위한 큰 ID
+                 position=self.final_destination,
+                 color=(0.0, 1.0, 0.0), # 초록색으로 강조
+                 text_label="Final Dest"
+             )
+             marker_array.markers.extend(final_dest_markers)
+            
         self.visual_marker_publisher.publish(marker_array)
-    
+
     # 미션 로직 구현 (BaseMissionNode의 추상 메서드)
     
     def run_mission_logic(self):
