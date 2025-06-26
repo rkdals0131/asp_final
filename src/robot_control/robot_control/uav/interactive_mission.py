@@ -3,6 +3,7 @@
 사용자 대화형 드론 미션 노드
 사용자 입력에 따라 드론을 제어하는 오프보드 제어 노드
 - 이륙, 착륙, 정지, 재시동, 지점 이동, 고도 및 짐벌 변경, 특정 지점 응시(stare) 기능을 수행
+- 저수준 제어를 통한 동적 기동(fall, dive) 기능 포함
 """
 import rclpy
 import threading
@@ -51,6 +52,9 @@ class InteractiveMissionNode(BaseMissionNode):
         
         # Head 기능을 위한 상태 변수
         self.target_yaw_deg = None
+        
+        # 저수준 기동을 위한 상태 변수
+        self.maneuver_params = {}
         
         # 사용자 입력을 위한 스레드
         self.input_thread = threading.Thread(target=self.command_input_loop)
@@ -103,6 +107,9 @@ class InteractiveMissionNode(BaseMissionNode):
         print("    maintain <altitude>      - 지정한 절대 고도로 이동/유지")
         print("    moveto <x> <y> <z>       - 지정한 절대좌표(map frame)로 이동")
         print("    head <degrees>           - 현재 위치에서 지정한 각도 방향으로 회전 (0=동쪽, 90=북쪽, 180=서쪽, 270=남쪽)")
+        print("  [동적 기동]")
+        print("    fall <altitude>          - 지정한 절대 고도까지 수직 강하")
+        print("    dive <pitch> <altitude>  - 지정한 피치각과 절대 고도로 급강하")
         print("  [짐벌 제어]")
         print("    look <0-6>               - 지정 번호의 주시 타겟을 한번 바라봄")
         print("    look forward             - 짐벌 정면으로 초기화")
@@ -144,6 +151,8 @@ class InteractiveMissionNode(BaseMissionNode):
                 self._handle_moveto_command(cmd[1:])
             elif command == "head" and len(cmd) > 1:
                 self._handle_head_command(cmd[1])
+            elif command in ["fall", "dive"] and len(cmd) > 1:
+                self._handle_low_level_command(command, cmd[1:])
             elif command == "look" and len(cmd) > 1:
                 self._handle_look_command(cmd[1])
             elif command == "stare" and len(cmd) > 1:
@@ -167,7 +176,7 @@ class InteractiveMissionNode(BaseMissionNode):
             self.get_logger().warn(f"이륙할 수 없는 상태: {self.state}")
     
     def _handle_land_command(self):
-        if self.state in ["IDLE", "MOVING", "TAKING_OFF"]:
+        if self.state in ["IDLE", "MOVING", "TAKING_OFF", "HEADING", "LOW_LEVEL_MANEUVER"]:
             self.state = "LANDING"
         else:
             self.get_logger().warn(f"착륙할 수 없는 상태: {self.state}")
@@ -181,11 +190,12 @@ class InteractiveMissionNode(BaseMissionNode):
             self.get_logger().warn(f"ARM은 LANDED 상태에서만 가능. 현재 상태: {self.state}")
     
     def _handle_stop_command(self):
-        if self.state in ["IDLE", "MOVING", "TAKING_OFF", "HEADING"]:
+        if self.state in ["IDLE", "MOVING", "TAKING_OFF", "HEADING", "LOW_LEVEL_MANEUVER"]:
             if self.current_map_pose:
-                self.get_logger().info("사용자 명령: STOP. 이동 정지.")
+                self.get_logger().info("사용자 명령: STOP. 모든 기동 정지.")
                 self.target_pose_map = copy.deepcopy(self.current_map_pose)
-                self.target_yaw_deg = None  # yaw 제어 해제
+                self.target_yaw_deg = None
+                self.maneuver_params = {} # 기동 파라미터 초기화
                 self.state = "IDLE"
             else:
                 self.get_logger().warn("현재 위치를 알 수 없어 정지할 수 없음")
@@ -315,14 +325,54 @@ class InteractiveMissionNode(BaseMissionNode):
             self.target_pose_map.pose.position.y = self.current_map_pose.pose.position.y
             self.target_pose_map.pose.position.z = self.current_map_pose.pose.position.z
             
-            # 목표 yaw 각도 저장 (임시로 target_pose_map에 저장하기 위해 새로운 속성 추가)
+            # 목표 yaw 각도 저장
             self.target_yaw_deg = target_yaw_deg
             
             self.get_logger().info(f"사용자 명령: HEAD {target_yaw_deg:.0f}도")
-            self.state = "HEADING"  # 새로운 상태 추가
+            self.state = "HEADING"
             
         except ValueError:
             self.get_logger().error(f"잘못된 각도 값입니다: {angle_str}")
+            
+    def _handle_low_level_command(self, command, args):
+        """저수준 동적 기동 명령을 처리합니다."""
+        if self.state not in ["IDLE", "HEADING"]:
+            self.get_logger().warn(f"'{command}' 기동을 시작할 수 없는 상태: {self.state}")
+            return
+        
+        try:
+            # 현재 드론의 yaw를 맵 좌표계 라디안으로 계산
+            q = self.current_map_pose.pose.orientation
+            siny_cosp = 2 * (q.w * q.z + q.x * q.y)
+            cosy_cosp = 1 - 2 * (q.y * q.y + q.z * q.z)
+            current_yaw_rad = math.atan2(siny_cosp, cosy_cosp)
+            
+            self.maneuver_params = {
+                'type': command,
+                'start_yaw_rad': current_yaw_rad,
+                'start_pos': copy.deepcopy(self.current_map_pose.pose.position)
+            }
+            
+            if command == "fall":
+                if len(args) != 1:
+                    self.get_logger().error("사용법: fall <altitude>")
+                    return
+                self.maneuver_params['target_altitude'] = float(args[0])
+                self.get_logger().info(f"수직 강하 시작! 목표 고도: {self.maneuver_params['target_altitude']:.2f}m")
+                
+            elif command == "dive":
+                if len(args) != 2:
+                    self.get_logger().error("사용법: dive <pitch> <altitude>")
+                    return
+                self.maneuver_params['target_pitch_deg'] = float(args[0])
+                self.maneuver_params['target_altitude'] = float(args[1])
+                self.get_logger().info(f"급강하 시작! 피치: {self.maneuver_params['target_pitch_deg']:.1f}도, 목표 고도: {self.maneuver_params['target_altitude']:.2f}m")
+            
+            self.state = "LOW_LEVEL_MANEUVER"
+
+        except ValueError:
+            self.get_logger().error(f"'{command}' 명령에 잘못된 숫자 인자가 주어졌습니다.")
+            self.maneuver_params = {}
     
     def _handle_look_command(self, sub_command):
         self.stare_target_index = None  # 'look' 명령은 항상 'stare'를 중지시킴
@@ -470,7 +520,12 @@ class InteractiveMissionNode(BaseMissionNode):
     
     def run_mission_logic(self):
         """대화형 미션의 상태 머신 로직을 구현합니다."""
-        
+
+        # 가드 구문: 저수준 제어 상태일 경우, 다른 로직을 건너뛰고 해당 핸들러만 실행
+        if self.state == "LOW_LEVEL_MANEUVER":
+            self._handle_low_level_maneuver_state()
+            return
+
         # Stare 모드 실행
         if self.stare_target_index is not None and self.state in ["IDLE", "MOVING"]:
             self.point_gimbal_at_target(self.stare_targets[self.stare_target_index])
@@ -521,7 +576,7 @@ class InteractiveMissionNode(BaseMissionNode):
             self.target_pose_map.pose.position.y,
             self.target_pose_map.pose.position.z
         ]
-        self.publish_position_setpoint(target_pos)
+        self.publish_position_setpoint(target_pos, self.target_yaw_deg)
         
         if self.check_arrival(target_pos):
             self.get_logger().info("목적지 도착. 호버링 상태.")
@@ -540,9 +595,18 @@ class InteractiveMissionNode(BaseMissionNode):
         
         # 위치 도착 확인 (yaw는 별도로 확인하지 않고 일정 시간 후 완료로 간주)
         if self.check_arrival(target_pos, tolerance=1.0):
-            self.get_logger().info(f"방향 회전 완료 ({self.target_yaw_deg:.0f}도). 호버링 상태.")
-            self.state = "IDLE"
-    
+            # 현재 yaw와 목표 yaw의 차이가 작은지 확인 (추가적인 안정성 확보)
+            q = self.current_map_pose.pose.orientation
+            siny_cosp = 2 * (q.w * q.z + q.x * q.y)
+            cosy_cosp = 1 - 2 * (q.y * q.y + q.z * q.z)
+            current_yaw_deg = math.degrees(math.atan2(siny_cosp, cosy_cosp))
+            
+            yaw_error = abs(dcu.normalize_angle_degrees(current_yaw_deg - self.target_yaw_deg))
+
+            if yaw_error < 5.0: # 5도 이내 오차
+                self.get_logger().info(f"방향 회전 완료 ({self.target_yaw_deg:.0f}도). 호버링 상태.")
+                self.state = "IDLE"
+
     def _handle_idle_state(self):
         """대기 상태 처리"""
         target_pos = [
@@ -558,6 +622,71 @@ class InteractiveMissionNode(BaseMissionNode):
         if self.land_detected and self.land_detected.landed:
             self.get_logger().info("착륙 성공. 'arm' 명령으로 재시동할 수 있습니다.")
             self.state = "LANDED"
+
+    def _handle_low_level_maneuver_state(self):
+        """저수준 동적 기동 상태를 처리 - 액추에이터 직접 제어"""
+        # 1. 액추에이터 직접 제어 모드 활성화 (모든 PX4 제어기 우회)
+        dcu.publish_offboard_control_mode(self, 
+                                          position=False, 
+                                          velocity=False, 
+                                          acceleration=False,
+                                          attitude=False, 
+                                          body_rate=False,
+                                          thrust_and_torque=False,
+                                          actuator=True)  # 액추에이터 직접 제어만 활성화
+
+        # 2. 기동 종류에 따라 모터 출력 계산
+        m_type = self.maneuver_params.get('type')
+        target_altitude = self.maneuver_params.get('target_altitude')
+        current_altitude = self.current_map_pose.pose.position.z
+        
+        # 3. 기동 완료 조건 확인
+        if current_altitude <= target_altitude + 0.5:
+            self.get_logger().info(f"{m_type} 기동 완료. 목표 고도 도달.")
+            self.target_pose_map = copy.deepcopy(self.current_map_pose)
+            self.maneuver_params = {}
+            self.state = "IDLE"
+            return
+            
+        # 4. 기동별 모터 출력 계산
+        if m_type == 'fall':
+            # 수직 자유낙하: 모터 출력을 극도로 감소
+            altitude_error = current_altitude - target_altitude
+            
+            if altitude_error > 10.0:
+                # 목표 고도까지 10m 이상 남았으면 거의 완전한 자유낙하
+                freefall_factor = 0.0  # 모터 출력 0% (완전 자유낙하)
+            elif altitude_error > 3.0:
+                # 3-10m 구간에서 점진적으로 모터 출력 증가 (감속 준비)
+                freefall_factor = (10.0 - altitude_error) / 7.0 * 0.2  # 0% → 20%
+            else:
+                # 3m 이내에서 강력한 감속 (안전한 착륙을 위해)
+                freefall_factor = 0.2 + (3.0 - altitude_error) / 3.0 * 0.6  # 20% → 80%
+                
+            motor_outputs = dcu.calculate_motor_outputs_for_freefall(
+                hover_thrust=0.5, 
+                freefall_factor=freefall_factor
+            )
+            
+            self.get_logger().info(f"FALL 실행중! 고도: {current_altitude:.1f}m → {target_altitude:.1f}m, 모터출력: {freefall_factor*100:.0f}%", 
+                                   throttle_duration_sec=0.3)
+            
+        elif m_type == 'dive':
+            # 급강하: 피치 각도에 따른 전진 급강하
+            pitch_deg = self.maneuver_params['target_pitch_deg']
+            # 피치 각도를 모터 출력 차이로 변환 (-90° = -1.0, 0° = 0.0, 90° = 1.0)
+            pitch_factor = pitch_deg / 90.0
+            
+            motor_outputs = dcu.calculate_motor_outputs_for_pitch(
+                hover_thrust=0.3,  # 급강하를 위해 기본 추력 감소
+                pitch_factor=pitch_factor
+            )
+            
+            self.get_logger().info(f"DIVE 실행중! 피치: {pitch_deg:.1f}도, 모터출력: {motor_outputs}", 
+                                   throttle_duration_sec=0.3)
+
+        # 5. 계산된 모터 출력 직접 발행 (모든 PX4 제한 우회!)
+        dcu.publish_actuator_motors(self, motor_outputs)
 
 
 def main(args=None):

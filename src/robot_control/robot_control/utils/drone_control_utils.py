@@ -6,7 +6,7 @@ PX4 오프보드 제어, 짐벌 제어, 좌표 변환 등의 공통 기능을 �
 
 import math
 import rclpy
-from px4_msgs.msg import VehicleCommand, OffboardControlMode, TrajectorySetpoint
+from px4_msgs.msg import VehicleCommand, OffboardControlMode, TrajectorySetpoint, VehicleAttitudeSetpoint, ActuatorMotors
 from geometry_msgs.msg import PoseStamped
 from rclpy.node import Node
 
@@ -73,6 +73,33 @@ def normalize_angle_radians(angle_rad):
     return angle_rad
 
 
+def get_quaternion_from_euler(roll_rad, pitch_rad, yaw_rad):
+    """
+    오일러 각(라디안)을 쿼터니언으로 변환합니다.
+    
+    Args:
+        roll_rad: Roll 각도 (라디안)
+        pitch_rad: Pitch 각도 (라디안)
+        yaw_rad: Yaw 각도 (라디안)
+        
+    Returns:
+        list: [w, x, y, z] 쿼터니언
+    """
+    cy = math.cos(yaw_rad * 0.5)
+    sy = math.sin(yaw_rad * 0.5)
+    cp = math.cos(pitch_rad * 0.5)
+    sp = math.sin(pitch_rad * 0.5)
+    cr = math.cos(roll_rad * 0.5)
+    sr = math.sin(roll_rad * 0.5)
+
+    w = cr * cp * cy + sr * sp * sy
+    x = sr * cp * cy - cr * sp * sy
+    y = cr * sp * cy + sr * cp * sy
+    z = cr * cp * sy - sr * sp * cy
+    
+    return [w, x, y, z]
+
+
 def map_yaw_to_px4_yaw_degrees(map_yaw_deg):
     """
     맵 좌표계 yaw(X축 기준 0도)를 PX4 yaw(북쪽 기준 0도)로 변환합니다.
@@ -128,7 +155,7 @@ def publish_vehicle_command(node, command, **kwargs):
     node.vehicle_command_publisher.publish(msg)
 
 
-def publish_offboard_control_mode(node, position=True, velocity=False, acceleration=False):
+def publish_offboard_control_mode(node, position=True, velocity=False, acceleration=False, attitude=False, body_rate=False, thrust_and_torque=False, actuator=False):
     """
     Offboard 제어 모드 메시지를 퍼블리시
     Args:
@@ -136,16 +163,54 @@ def publish_offboard_control_mode(node, position=True, velocity=False, accelerat
         position (bool): 위치 제어 활성화 여부
         velocity (bool): 속도 제어 활성화 여부
         acceleration (bool): 가속도 제어 활성화 여부
+        attitude (bool): 자세 제어 활성화 여부
+        body_rate (bool): 각속도 제어 활성화 여부
+        thrust_and_torque (bool): 추력/토크 제어 활성화 여부
+        actuator (bool): 액추에이터 직접 제어 활성화 여부
     """
     msg = OffboardControlMode(
         position=position,
         velocity=velocity,
         acceleration=acceleration,
-        attitude=False,
-        body_rate=False, # 추가: body_rate는 사용하지 않으므로 명시적으로 False 설정
+        attitude=attitude,
+        body_rate=body_rate,
+        thrust_and_torque=thrust_and_torque,
+        direct_actuator=actuator,  # 액추에이터 직접 제어 모드
         timestamp=int(node.get_clock().now().nanoseconds / 1000)
     )
     node.offboard_control_mode_publisher.publish(msg)
+
+
+def publish_attitude_setpoint(node, q: list, thrust_value: float):
+    """
+    자세 및 추력 세트포인트를 퍼블리시합니다.
+    
+    Args:
+        node: ROS2 노드 인스턴스
+        q: 목표 자세 쿼터니언 [w, x, y, z]
+        thrust_value: 정규화된 추력 값 (0.0 ~ 1.0)
+    """
+    if not hasattr(node, 'attitude_setpoint_publisher'):
+        node.get_logger().error("attitude_setpoint_publisher가 초기화되지 않았습니다!")
+        return
+        
+    # 입력값 검증 및 제한
+    thrust_clamped = max(0.0, min(1.0, float(thrust_value)))
+    quaternion = [float(val) for val in q]
+    
+    msg = VehicleAttitudeSetpoint()
+    msg.timestamp = int(node.get_clock().now().nanoseconds / 1000)
+    msg.q_d = quaternion
+    
+    # PX4는 FRD (Front-Right-Down) 바디 프레임을 사용하므로,
+    # 상승을 위한 추력은 -Z 방향으로 작용해야 함.
+    # thrust_body[2]가 음수일 때 상승, 양수일 때 하강
+    msg.thrust_body = [0.0, 0.0, -thrust_clamped]
+    
+    node.attitude_setpoint_publisher.publish(msg)
+    
+    # 디버깅을 위한 상세 로그 (필요시)
+    # node.get_logger().debug(f"자세 명령 발행: q={quaternion}, thrust={thrust_clamped}")
 
 
 def point_gimbal_at_target(node, drone_map_pose: PoseStamped, target_enu_pos: list):
@@ -448,4 +513,74 @@ def enu_to_local_frame(map_pos, current_local_pos, current_map_pose):
     return [float(target_ned_x), float(target_ned_y), float(target_ned_z)]
 
 
- 
+def publish_actuator_motors(node, motor_outputs: list):
+    """
+    개별 모터 출력을 직접 제어합니다. (모든 PX4 안전장치 우회)
+    
+    Args:
+        node: ROS2 노드 인스턴스
+        motor_outputs: 각 모터의 출력 값 리스트 (0.0 ~ 1.0, 일반적으로 4개 모터)
+                      [front_right, back_left, front_left, back_right] 순서
+    """
+    if not hasattr(node, 'actuator_motors_publisher'):
+        node.get_logger().error("actuator_motors_publisher가 초기화되지 않았습니다!")
+        return
+    
+    msg = ActuatorMotors()
+    msg.timestamp = int(node.get_clock().now().nanoseconds / 1000)
+    
+    # 모터 출력 값 설정 (최대 12개 모터 지원, X500은 4개만 사용)
+    # 값 범위: -1.0 ~ 1.0 (일반적으로 0.0 ~ 1.0 사용)
+    motor_count = min(len(motor_outputs), 12)
+    msg.control = [0.0] * 12  # 12개 모터 배열 초기화
+    
+    for i in range(motor_count):
+        # 0.0 ~ 1.0 범위로 클램핑
+        msg.control[i] = max(0.0, min(1.0, float(motor_outputs[i])))
+    
+    # 남은 모터들은 0.0으로 설정 (이미 초기화됨)
+    
+    node.actuator_motors_publisher.publish(msg)
+    
+    node.get_logger().debug(f"모터 출력 명령: {motor_outputs[:motor_count]}")
+
+
+def calculate_motor_outputs_for_freefall(hover_thrust=0.5, freefall_factor=0.0):
+    """
+    자유낙하를 위한 모터 출력 값을 계산합니다.
+    
+    Args:
+        hover_thrust: 호버링을 위한 기본 추력 (일반적으로 0.5)
+        freefall_factor: 자유낙하 정도 (0.0=완전 자유낙하, 1.0=정상 호버링)
+        
+    Returns:
+        list: 4개 모터의 출력 값 [front_right, back_left, front_left, back_right]
+    """
+    # 자유낙하를 위해 모든 모터의 출력을 동일하게 감소
+    output = hover_thrust * freefall_factor
+    
+    # X500 쿼드콥터의 4개 모터에 동일한 출력 적용
+    return [output, output, output, output]
+
+
+def calculate_motor_outputs_for_pitch(hover_thrust=0.5, pitch_factor=0.0):
+    """
+    피치 기동(전진/후진)을 위한 모터 출력 값을 계산합니다.
+    
+    Args:
+        hover_thrust: 호버링을 위한 기본 추력
+        pitch_factor: 피치 강도 (-1.0=최대 후진, 0.0=중립, 1.0=최대 전진)
+        
+    Returns:
+        list: 4개 모터의 출력 값 [front_right, back_left, front_left, back_right]
+    """
+    # 피치를 위해 앞/뒤 모터 출력을 다르게 설정
+    front_thrust = hover_thrust - pitch_factor * 0.3  # 전진 시 앞 모터 감소
+    back_thrust = hover_thrust + pitch_factor * 0.3   # 전진 시 뒤 모터 증가
+    
+    # 출력 범위 제한
+    front_thrust = max(0.0, min(1.0, front_thrust))
+    back_thrust = max(0.0, min(1.0, back_thrust))
+    
+    # [front_right, back_left, front_left, back_right]
+    return [front_thrust, back_thrust, front_thrust, back_thrust]

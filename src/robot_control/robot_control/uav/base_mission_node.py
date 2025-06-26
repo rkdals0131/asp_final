@@ -13,7 +13,7 @@ from abc import ABC, abstractmethod
 from rclpy.duration import Duration
 
 # ROS2 메시지 임포트
-from px4_msgs.msg import OffboardControlMode, TrajectorySetpoint, VehicleCommand, VehicleLocalPosition, VehicleAttitude
+from px4_msgs.msg import OffboardControlMode, TrajectorySetpoint, VehicleCommand, VehicleLocalPosition, VehicleAttitude, VehicleAttitudeSetpoint, ActuatorMotors
 from geometry_msgs.msg import PoseStamped
 from std_msgs.msg import String
 from visualization_msgs.msg import MarkerArray
@@ -67,6 +67,12 @@ class BaseMissionNode(Node, ABC):
         )
         self.trajectory_setpoint_publisher = self.create_publisher(
             TrajectorySetpoint, "/fmu/in/trajectory_setpoint", 10
+        )
+        self.attitude_setpoint_publisher = self.create_publisher(
+            VehicleAttitudeSetpoint, "/fmu/in/vehicle_attitude_setpoint", 10
+        )
+        self.actuator_motors_publisher = self.create_publisher(
+            ActuatorMotors, "/fmu/in/actuator_motors", 10
         )
         self.vehicle_command_publisher = self.create_publisher(
             VehicleCommand, "/fmu/in/vehicle_command", 10
@@ -214,6 +220,11 @@ class BaseMissionNode(Node, ABC):
         
         # 상태 퍼블리시
         self.state_publisher.publish(String(data=self.state))
+        
+        # 저수준 제어 상태에서는 미션별 로직만 실행하고 공통 제어는 건너뜀
+        if self.state == "LOW_LEVEL_MANEUVER":
+            self.run_mission_logic()
+            return
         
         # Offboard 제어 모드 퍼블리시 (특정 상태 제외)
         if self.state not in ["LANDING", "LANDED", "INIT", "DISARMED"]:
@@ -448,4 +459,4 @@ class BaseMissionNode(Node, ABC):
         """노드 종료 시 정리 작업"""
         if hasattr(self, 'state_machine_timer'):
             self.state_machine_timer.cancel()
-        super().destroy_node() 
+        super().destroy_node()
