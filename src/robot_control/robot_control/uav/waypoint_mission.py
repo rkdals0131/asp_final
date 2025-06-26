@@ -60,12 +60,12 @@ class WaypointMissionNode(BaseMissionNode):
         
         # 정밀 착륙 관련 변수 및 파라미터
         self.declare_parameter('landing_altitude', 0.5)
-        self.declare_parameter('descent_speed', 7.0, 
+        self.declare_parameter('descent_speed', 2.5, 
             ParameterDescriptor(description="마커 정렬 후 최종 착륙 시 하강 속도 (m/s)"))
         self.declare_parameter('horizontal_tolerance', 0.15)
         self.declare_parameter('vertical_tolerance', 0.3)
         self.declare_parameter('landing_marker_id', 10)  # 착륙용 마커 ID
-        self.declare_parameter('search_descent_speed', 7.0, 
+        self.declare_parameter('search_descent_speed', 3.0, 
             ParameterDescriptor(description="마커를 탐색하며 하강할 때의 속도 (m/s)"))
         self.declare_parameter('precision_horizontal_tolerance', 0.1)  # 정밀 착륙 시 수평 허용 오차
         
@@ -78,8 +78,8 @@ class WaypointMissionNode(BaseMissionNode):
         self.precision_horizontal_tolerance = self.get_parameter('precision_horizontal_tolerance').value
         
         # 자유낙하 파라미터 (고도 기반)
-        self.freefall_altitude_drop = 4.8  # 자유낙하 시 4m 하강
-        self.stabilization_duration = 2.0  # 자유낙하 후 안정화 시간 2초
+        self.freefall_altitude_drop = 2.0  
+        self.stabilization_duration = 3.0  # 자유낙하 후 안정화 시간 5초
         
         self.landing_marker_pose = None
         self.last_marker_detection_time = None
@@ -502,7 +502,7 @@ class WaypointMissionNode(BaseMissionNode):
             self.state = "MOVING_TO_WAYPOINT"
 
     def _handle_freefall_state(self):
-        """자유낙하 기동 상태. 모터를 강제로 끄고 4m 하강 후 다시 켜기"""
+        """자유낙하 기동 상태. 모터를 강제로 끄고 3.89m 하강 후 다시 켜기"""
         # Offboard failsafe 방지를 위해 지속적으로 offboard control mode 전송
         dcu.publish_offboard_control_mode(self, 
                                           position=False, 
@@ -518,22 +518,30 @@ class WaypointMissionNode(BaseMissionNode):
             self.get_logger().info("모터 강제 비활성화! 자유낙하 시작")
             self.motors_disabled = True
 
-        # 모터 정지 명령 지속적 전송 (failsafe 방지)
+        # 모터 정지 명령 지속적 전송 (failsafe 방지) - 100Hz로 실행됨
         dcu.publish_actuator_motors(self, [0.0, 0.0, 0.0, 0.0])
 
-        # 고도 확인 (4.8m 하강 시 모터 재활성화)
+        # 고도 확인 (3.89m 하강 시 모터 재활성화) - 100Hz로 실시간 체크
         if self.current_map_pose and self.freefall_start_altitude is not None:
             current_altitude = self.current_map_pose.pose.position.z
             altitude_dropped = self.freefall_start_altitude - current_altitude
             
-            self.get_logger().info(f"자유낙하 중... (하강: {altitude_dropped:.2f}m / 목표: {self.freefall_altitude_drop}m) | Offboard: {self.is_offboard_enabled}", 
-                                 throttle_duration_sec=0.2)
+            # 100Hz 고속 체크, 로그만 5Hz로 출력
+            if not hasattr(self, '_freefall_log_counter'):
+                self._freefall_log_counter = 0
+            self._freefall_log_counter += 1
             
+            # 20카운트마다 로그 출력 (100Hz / 20 = 5Hz)
+            if self._freefall_log_counter % 20 == 0:
+                self.get_logger().info(f"자유낙하 중... (하강: {altitude_dropped:.2f}m / 목표: {self.freefall_altitude_drop}m) | Offboard: {self.is_offboard_enabled}")
+            
+            # 실제 조건 체크는 매 100Hz마다 수행 (즉시 반응)
             if altitude_dropped >= self.freefall_altitude_drop:
                 self.get_logger().info(f"자유낙하 완료 ({altitude_dropped:.2f}m 하강). 모터 강제 재활성화 후 안정화 모드로 전환")
                 self.state = "STABILIZING"
                 self.stabilization_start_time = self.get_clock().now()
                 self.motors_disabled = False  # 모터 다시 활성화 표시
+                self._freefall_log_counter = 0  # 카운터 리셋
         else:
             self.get_logger().warn("고도 정보가 없어 자유낙하를 정상적으로 처리할 수 없습니다.", throttle_duration_sec=1.0)
 
