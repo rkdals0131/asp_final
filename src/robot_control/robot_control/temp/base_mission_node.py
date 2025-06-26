@@ -117,8 +117,8 @@ class BaseMissionNode(Node, ABC):
         # 공통 미션 데이터
         self._setup_mission_data()
         
-        # 상태 머신 타이머 (100Hz)
-        self.mission_timer = self.create_timer(0.01, self.run_state_machine_wrapper)
+        # 상태 머신 타이머 (10Hz)
+        self.state_machine_timer = self.create_timer(0.1, self.run_state_machine_wrapper)
         
         self.get_logger().info(f"{node_name} initialized successfully.")
     
@@ -164,20 +164,6 @@ class BaseMissionNode(Node, ABC):
         
         # 최종 목적지 (편의를 위한 별칭)
         self.final_destination = self.stare_targets[-1]
-        
-        # 특수 기동 웨이포인트 (fall, dive 등의 테스트용)
-        self.maneuver_waypoints = {
-            'freefall_test': [
-                [-95, 80, 25, 0, 'fall', 10],      # [x, y, z, yaw, maneuver_type, target_alt]
-                [-77, 80, 20, 0, 'fall', 8],
-                [-63, 75, 15, 0, 'fall', 5]
-            ],
-            'dive_test': [
-                [-95, 80, 25, 315, 'dive', 15, -30],  # [x, y, z, yaw, maneuver_type, target_alt, pitch]
-                [-77, 80, 20, 300, 'dive', 12, -45],
-                [-63, 75, 18, 180, 'dive', 8, -60]
-            ]
-        }
     
     # 공통 콜백 함수들
     
@@ -471,6 +457,6 @@ class BaseMissionNode(Node, ABC):
     
     def destroy_node(self):
         """노드 종료 시 정리 작업"""
-        if hasattr(self, 'mission_timer'):
-            self.mission_timer.cancel()
+        if hasattr(self, 'state_machine_timer'):
+            self.state_machine_timer.cancel()
         super().destroy_node()

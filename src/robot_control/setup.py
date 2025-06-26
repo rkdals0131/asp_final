@@ -39,6 +39,7 @@ setup(
             'dashboard_node = robot_control.admin.dashboard_node:main',
             'mission_control_node = robot_control.admin.mission_control_node:main',
             'interactive_mission = robot_control.uav.interactive_mission:main',
+            'interactive_calibration = robot_control.uav.interactive_calibration:main',
             'waypoint_mission = robot_control.uav.waypoint_mission:main',
             'advanced_waypoint_mission = robot_control.uav.advanced_waypoint_mission:main',
             'path_follower_node = robot_control.ugv.path_follower_node:main',

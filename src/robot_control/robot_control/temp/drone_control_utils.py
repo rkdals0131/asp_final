@@ -6,20 +6,13 @@ PX4 오프보드 제어, 짐벌 제어, 좌표 변환 등의 공통 기능을 �
 
 import math
 import rclpy
-import time
 from px4_msgs.msg import VehicleCommand, OffboardControlMode, TrajectorySetpoint, VehicleAttitudeSetpoint, ActuatorMotors
 from geometry_msgs.msg import PoseStamped
 from rclpy.node import Node
 
 
+# === 각도 변환 유틸리티 함수들 ===
 
-
-
-# ============================================
-# 기존 유틸리티 함수들 (단순화)
-# ============================================
-
-# === 각도 변환 함수들 ===
 def degrees_to_radians(degrees):
     """
     도(degree)를 라디안으로 변환합니다.
@@ -552,104 +545,9 @@ def publish_actuator_motors(node, motor_outputs: list):
     node.get_logger().debug(f"모터 출력 명령: {motor_outputs[:motor_count]}")
 
 
-def calculate_adaptive_motor_outputs_for_fall(current_altitude, target_altitude, vertical_velocity, vertical_acceleration, hover_thrust=0.5):
-    """
-    실시간 속도/가속도 피드백을 사용한 적응형 자유낙하 제어
-    
-    Args:
-        current_altitude: 현재 고도 (m)
-        target_altitude: 목표 고도 (m)
-        vertical_velocity: 현재 수직 속도 (m/s, NED 좌표계, 양수=하강)
-        vertical_acceleration: 현재 수직 가속도 (m/s², NED 좌표계)
-        hover_thrust: 호버링 기본 추력 (일반적으로 0.5)
-        
-    Returns:
-        tuple: (motor_outputs, control_info)
-            - motor_outputs: 4개 모터 출력값 리스트 [0.0-1.0]
-            - control_info: 제어 상태 정보 딕셔너리
-    """
-    altitude_error = current_altitude - target_altitude
-    
-    # 제어 단계 구분
-    if altitude_error > 10.0:
-        # 단계 1: 자유낙하 단계 (10m 이상 거리)
-        # 목표: 빠른 하강 속도 달성
-        target_descent_rate = min(8.0, altitude_error * 0.5)  # 최대 8m/s 하강
-        
-        if vertical_velocity < target_descent_rate * 0.7:
-            # 하강 속도가 부족하면 추력 더 감소
-            thrust_factor = 0.0
-        else:
-            # 적절한 하강 속도면 약간의 추력 유지
-            thrust_factor = 0.1
-            
-        control_mode = "FREEFALL"
-        
-    elif altitude_error > 3.0:
-        # 단계 2: 감속 준비 단계 (3-10m 구간)
-        # 목표: 점진적으로 하강 속도 감소
-        distance_factor = (altitude_error - 3.0) / 7.0  # 1.0 → 0.0
-        target_descent_rate = 2.0 + distance_factor * 4.0  # 6m/s → 2m/s
-        
-        # 속도 피드백 제어
-        velocity_error = vertical_velocity - target_descent_rate
-        
-        if velocity_error > 1.0:
-            # 너무 빠르게 하강 중 → 추력 증가
-            thrust_factor = 0.2 + min(0.3, velocity_error * 0.1)
-        elif velocity_error < -1.0:
-            # 너무 느리게 하강 중 → 추력 감소
-            thrust_factor = max(0.0, 0.2 + velocity_error * 0.1)
-        else:
-            # 적절한 속도 → 기본 추력
-            thrust_factor = 0.2
-            
-        control_mode = "DECEL_PREP"
-        
-    else:
-        # 단계 3: 최종 감속 단계 (3m 이내)
-        # 목표: 안전한 착륙 속도로 감속
-        target_descent_rate = max(0.5, altitude_error * 0.5)  # 1.5m/s → 0.5m/s
-        
-        # 더 강한 피드백 제어
-        velocity_error = vertical_velocity - target_descent_rate
-        
-        # 기본 추력을 높게 시작
-        base_thrust = 0.6
-        velocity_correction = velocity_error * 0.2
-        thrust_factor = max(0.3, min(0.9, base_thrust + velocity_correction))
-        
-        control_mode = "FINAL_DECEL"
-    
-    # 가속도 기반 미세 조정 (급격한 변화 방지)
-    if abs(vertical_acceleration) > 15.0:  # 1.5G 이상의 급격한 가속도
-        # 급격한 변화를 완화하기 위해 추력 조정
-        if vertical_acceleration > 15.0:  # 급격한 감속
-            thrust_factor *= 0.9  # 추력 약간 감소
-        else:  # 급격한 가속
-            thrust_factor *= 1.1  # 추력 약간 증가
-            thrust_factor = min(1.0, thrust_factor)
-    
-    # 최종 모터 출력 계산
-    final_thrust = hover_thrust * thrust_factor
-    motor_outputs = [final_thrust, final_thrust, final_thrust, final_thrust]
-    
-    # 제어 정보 생성
-    control_info = {
-        'control_mode': control_mode,
-        'altitude_error': altitude_error,
-        'vertical_velocity': vertical_velocity,
-        'vertical_acceleration': vertical_acceleration,
-        'thrust_factor': thrust_factor,
-        'target_descent_rate': target_descent_rate if 'target_descent_rate' in locals() else 0.0
-    }
-    
-    return motor_outputs, control_info
-
-
 def calculate_motor_outputs_for_freefall(hover_thrust=0.5, freefall_factor=0.0):
     """
-    기존 단순한 자유낙하 모터 출력 계산 (하위 호환성 유지)
+    자유낙하를 위한 모터 출력 값을 계산합니다.
     
     Args:
         hover_thrust: 호버링을 위한 기본 추력 (일반적으로 0.5)
@@ -663,86 +561,6 @@ def calculate_motor_outputs_for_freefall(hover_thrust=0.5, freefall_factor=0.0):
     
     # X500 쿼드콥터의 4개 모터에 동일한 출력 적용
     return [output, output, output, output]
-
-
-# ============================================
-# 기동 데이터 기록 및 분석 함수들
-# ============================================
-
-class ManeuverDataLogger:
-    """동적 기동 데이터 로거 클래스"""
-    
-    def __init__(self):
-        self.data_log = []
-        self.start_time = None
-        
-    def start_logging(self):
-        """로깅 시작"""
-        self.data_log = []
-        self.start_time = time.time()
-        
-    def log_data_point(self, timestamp, altitude, velocity, acceleration, motor_outputs, control_info):
-        """데이터 포인트 기록"""
-        if self.start_time is None:
-            self.start_time = timestamp
-            
-        data_point = {
-            'time': timestamp - self.start_time,
-            'altitude': altitude,
-            'velocity_z': velocity,
-            'acceleration_z': acceleration,
-            'motor_outputs': motor_outputs.copy() if isinstance(motor_outputs, list) else motor_outputs,
-            'control_info': control_info.copy() if isinstance(control_info, dict) else {}
-        }
-        
-        self.data_log.append(data_point)
-        
-    def save_to_csv(self, filename):
-        """CSV 파일로 저장"""
-        import csv
-        
-        if not self.data_log:
-            return False
-            
-        with open(filename, 'w', newline='') as csvfile:
-            fieldnames = ['time', 'altitude', 'velocity_z', 'acceleration_z', 
-                         'motor_output_avg', 'control_mode', 'thrust_factor']
-            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-            
-            writer.writeheader()
-            for data in self.data_log:
-                motor_avg = sum(data['motor_outputs']) / len(data['motor_outputs'])
-                control_info = data.get('control_info', {})
-                
-                writer.writerow({
-                    'time': data['time'],
-                    'altitude': data['altitude'],
-                    'velocity_z': data['velocity_z'],
-                    'acceleration_z': data['acceleration_z'],
-                    'motor_output_avg': motor_avg,
-                    'control_mode': control_info.get('control_mode', 'UNKNOWN'),
-                    'thrust_factor': control_info.get('thrust_factor', 0.0)
-                })
-        
-        return True
-        
-    def get_summary_stats(self):
-        """요약 통계 계산"""
-        if not self.data_log:
-            return {}
-            
-        altitudes = [d['altitude'] for d in self.data_log]
-        velocities = [d['velocity_z'] for d in self.data_log]
-        accelerations = [d['acceleration_z'] for d in self.data_log]
-        
-        return {
-            'total_time': self.data_log[-1]['time'],
-            'altitude_drop': altitudes[0] - altitudes[-1],
-            'max_descent_rate': max(velocities),
-            'avg_descent_rate': sum(velocities) / len(velocities),
-            'max_acceleration': max(accelerations),
-            'data_points': len(self.data_log)
-        }
 
 
 def calculate_motor_outputs_for_pitch(hover_thrust=0.5, pitch_factor=0.0):

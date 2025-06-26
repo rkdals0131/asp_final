@@ -86,8 +86,6 @@ class InteractiveMissionNode(BaseMissionNode):
             throttle_duration_sec=1
         )
     
-
-    
     # 사용자 입력 처리
     
     def command_input_loop(self):
@@ -197,7 +195,7 @@ class InteractiveMissionNode(BaseMissionNode):
                 self.get_logger().info("사용자 명령: STOP. 모든 기동 정지.")
                 self.target_pose_map = copy.deepcopy(self.current_map_pose)
                 self.target_yaw_deg = None
-                self.maneuver_params = {}  # 기동 파라미터 초기화
+                self.maneuver_params = {} # 기동 파라미터 초기화
                 self.state = "IDLE"
             else:
                 self.get_logger().warn("현재 위치를 알 수 없어 정지할 수 없음")
@@ -375,8 +373,6 @@ class InteractiveMissionNode(BaseMissionNode):
         except ValueError:
             self.get_logger().error(f"'{command}' 명령에 잘못된 숫자 인자가 주어졌습니다.")
             self.maneuver_params = {}
-    
-
     
     def _handle_look_command(self, sub_command):
         self.stare_target_index = None  # 'look' 명령은 항상 'stare'를 중지시킴
@@ -654,46 +650,26 @@ class InteractiveMissionNode(BaseMissionNode):
             
         # 4. 기동별 모터 출력 계산
         if m_type == 'fall':
-            # 개선된 적응형 자유낙하 제어 사용
-            if self.current_local_pos and hasattr(self.current_local_pos, 'vz') and hasattr(self.current_local_pos, 'az'):
-                # 실시간 속도/가속도 데이터 사용 
-                vertical_velocity = self.current_local_pos.vz  # NED 좌표계, 양수=하강
-                vertical_acceleration = self.current_local_pos.az
-                
-                motor_outputs, control_info = dcu.calculate_adaptive_motor_outputs_for_fall(
-                    current_altitude=current_altitude,
-                    target_altitude=target_altitude,
-                    vertical_velocity=vertical_velocity,
-                    vertical_acceleration=vertical_acceleration,
-                    hover_thrust=0.5
-                )
-                
-                self.get_logger().info(
-                    f"FALL 적응제어 | {control_info['control_mode']} | "
-                    f"고도: {current_altitude:.1f}→{target_altitude:.1f}m | "
-                    f"속도: {vertical_velocity:.2f}m/s | "
-                    f"가속도: {vertical_acceleration:.2f}m/s² | "
-                    f"추력: {control_info['thrust_factor']*100:.0f}%", 
-                    throttle_duration_sec=0.2
-                )
+            # 수직 자유낙하: 모터 출력을 극도로 감소
+            altitude_error = current_altitude - target_altitude
+            
+            if altitude_error > 10.0:
+                # 목표 고도까지 10m 이상 남았으면 거의 완전한 자유낙하
+                freefall_factor = 0.0  # 모터 출력 0% (완전 자유낙하)
+            elif altitude_error > 3.0:
+                # 3-10m 구간에서 점진적으로 모터 출력 증가 (감속 준비)
+                freefall_factor = (10.0 - altitude_error) / 7.0 * 0.2  # 0% → 20%
             else:
-                # 기존 단순 제어로 폴백
-                altitude_error = current_altitude - target_altitude
+                # 3m 이내에서 강력한 감속 (안전한 착륙을 위해)
+                freefall_factor = 0.2 + (3.0 - altitude_error) / 3.0 * 0.6  # 20% → 80%
                 
-                if altitude_error > 10.0:
-                    freefall_factor = 0.0  # 완전 자유낙하
-                elif altitude_error > 3.0:
-                    freefall_factor = (10.0 - altitude_error) / 7.0 * 0.2  # 0% → 20%
-                else:
-                    freefall_factor = 0.2 + (3.0 - altitude_error) / 3.0 * 0.6  # 20% → 80%
-                    
-                motor_outputs = dcu.calculate_motor_outputs_for_freefall(
-                    hover_thrust=0.5, 
-                    freefall_factor=freefall_factor
-                )
-                
-                self.get_logger().info(f"FALL 기본제어 | 고도: {current_altitude:.1f}m → {target_altitude:.1f}m | 모터출력: {freefall_factor*100:.0f}%", 
-                                       throttle_duration_sec=0.3)
+            motor_outputs = dcu.calculate_motor_outputs_for_freefall(
+                hover_thrust=0.5, 
+                freefall_factor=freefall_factor
+            )
+            
+            self.get_logger().info(f"FALL 실행중! 고도: {current_altitude:.1f}m → {target_altitude:.1f}m, 모터출력: {freefall_factor*100:.0f}%", 
+                                   throttle_duration_sec=0.3)
             
         elif m_type == 'dive':
             # 급강하: 피치 각도에 따른 전진 급강하
