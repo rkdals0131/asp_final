@@ -53,8 +53,14 @@ class InteractiveMissionNode(BaseMissionNode):
         # Head 기능을 위한 상태 변수
         self.target_yaw_deg = None
         
-        # 저수준 기동을 위한 상태 변수
+        # 고주사율 저수준 제어 시스템
+        self.high_freq_controller = dcu.HighFrequencyController()
+        self.maneuver_calculator = dcu.ManeuverCalculator()
         self.maneuver_params = {}
+        
+        # 100Hz 고주사율 제어 타이머 (LOW_LEVEL_MANEUVER 상태에서만 활성화)
+        self.high_freq_timer = None
+        self.debug_mode = False  # 디버그 모드 플래그
         
         # 사용자 입력을 위한 스레드
         self.input_thread = threading.Thread(target=self.command_input_loop)
@@ -86,6 +92,116 @@ class InteractiveMissionNode(BaseMissionNode):
             throttle_duration_sec=1
         )
     
+    def start_high_frequency_control(self):
+        """100Hz 고주사율 제어 시작"""
+        if self.high_freq_timer is None:
+            self.high_freq_timer = self.create_timer(0.01, self.high_freq_control_loop)  # 100Hz
+            self.get_logger().info("100Hz 고주사율 제어 시작")
+    
+    def stop_high_frequency_control(self):
+        """고주사율 제어 중지"""
+        if self.high_freq_timer is not None:
+            self.high_freq_timer.cancel()
+            self.high_freq_timer = None
+            self.get_logger().info("고주사율 제어 중지")
+    
+    def high_freq_control_loop(self):
+        """100Hz 고주사율 제어 루프"""
+        if self.state != "LOW_LEVEL_MANEUVER" or not self.current_map_pose:
+            return
+        
+        current_time = self.get_clock().now()
+        current_pos = [
+            self.current_map_pose.pose.position.x,
+            self.current_map_pose.pose.position.y, 
+            self.current_map_pose.pose.position.z
+        ]
+        
+        # 기동 타입별 제어
+        m_type = self.maneuver_params.get('type')
+        target_alt = self.maneuver_params.get('target_altitude')
+        
+        if m_type == 'fall':
+            # ★ 자유낙하: PID 완전 우회, 모터 RPM 직접 제어만
+            traj = self.maneuver_calculator.calculate_freefall_trajectory(
+                current_pos[2], target_alt, current_time
+            )
+            
+            thrust_factor = traj['thrust_factor']
+            motor_outputs = [thrust_factor * 0.5] * 4  # 4개 모터 동일 출력
+            
+            # 모터 출력 직접 발행 (PID 없음!)
+            dcu.publish_actuator_motors(self, motor_outputs)
+            
+        elif m_type == 'fastfall':
+            # ★ 더 공격적인 자유낙하: 모터 완전 차단
+            traj = self.maneuver_calculator.calculate_fastfall_trajectory(
+                current_pos[2], target_alt, current_time
+            )
+            
+            thrust_factor = traj['thrust_factor']
+            motor_outputs = [thrust_factor * 0.5] * 4  # 4개 모터 동일 출력
+            
+            # 모터 출력 직접 발행 (PID 없음!)
+            dcu.publish_actuator_motors(self, motor_outputs)
+            
+        elif m_type == 'dive':
+            # ★ 급강하: PID 제어 사용
+            # 현재 자세 계산
+            q = self.current_map_pose.pose.orientation
+            siny_cosp = 2 * (q.w * q.z + q.x * q.y)
+            cosy_cosp = 1 - 2 * (q.y * q.y + q.z * q.z)
+            yaw = math.atan2(siny_cosp, cosy_cosp)
+            
+            sinr_cosp = 2 * (q.w * q.x + q.y * q.z)
+            cosr_cosp = 1 - 2 * (q.x * q.x + q.y * q.y)
+            roll = math.atan2(sinr_cosp, cosr_cosp)
+            
+            sinp = 2 * (q.w * q.y - q.z * q.x)
+            pitch = math.asin(sinp) if abs(sinp) < 1 else math.copysign(math.pi/2, sinp)
+            
+            current_att = {'roll': roll, 'pitch': pitch, 'yaw': yaw}
+            
+            # 급강하 궤적 계산
+            pitch_deg = self.maneuver_params.get('target_pitch_deg', 0)
+            traj = self.maneuver_calculator.calculate_dive_trajectory(
+                pitch_deg, current_pos, target_alt, current_time
+            )
+            
+            # 위치 제어 (수평 위치 유지)
+            target_pos = [current_pos[0], current_pos[1], current_pos[2]]
+            target_attitudes = self.high_freq_controller.update_position_control(
+                target_pos, current_pos, current_time
+            )
+            
+            # 자세 제어 (피치 강제 적용)
+            target_attitudes.update({
+                'pitch': traj['pitch_target'],
+                'thrust': 0.5 * traj['thrust_factor']
+            })
+            
+            motor_outputs = self.high_freq_controller.update_attitude_control(
+                target_attitudes, current_att, current_time
+            )
+            
+            # 모터 출력 발행
+            dcu.publish_actuator_motors(self, motor_outputs)
+        else:
+            return
+        
+        # 디버그 로그 (debug 모드일 때만, 10Hz로 제한)
+        if self.debug_mode:
+            if hasattr(self, '_last_debug_time'):
+                if (current_time - self._last_debug_time).nanoseconds > 100000000:  # 0.1초
+                    if m_type in ['fall', 'fastfall']:
+                        self.get_logger().info(f"{m_type.upper()}: 고도 {current_pos[2]:.1f}m→{target_alt:.1f}m, 추력계수 {traj['thrust_factor']:.2f}, 모터 {[f'{m:.2f}' for m in motor_outputs]}")
+                    else:
+                        current_att = {'roll': roll, 'pitch': pitch, 'yaw': yaw}
+                        self.get_logger().info(f"{m_type.upper()}: 고도 {current_pos[2]:.1f}m, 자세 R{math.degrees(current_att['roll']):.1f}° P{math.degrees(current_att['pitch']):.1f}° Y{math.degrees(current_att['yaw']):.1f}°, 모터 {[f'{m:.2f}' for m in motor_outputs]}")
+                    self._last_debug_time = current_time
+            else:
+                self._last_debug_time = current_time
+    
     # 사용자 입력 처리
     
     def command_input_loop(self):
@@ -109,7 +225,13 @@ class InteractiveMissionNode(BaseMissionNode):
         print("    head <degrees>           - 현재 위치에서 지정한 각도 방향으로 회전 (0=동쪽, 90=북쪽, 180=서쪽, 270=남쪽)")
         print("  [동적 기동]")
         print("    fall <altitude>          - 지정한 절대 고도까지 수직 강하")
+        print("    fastfall <altitude>      - 더 공격적인 자유낙하 (테스트용)")
         print("    dive <pitch> <altitude>  - 지정한 피치각과 절대 고도로 급강하")
+        print("  [PID 캘리브레이션]")
+        print("    tune pos <x|y|z> <Kp> <Ki> <Kd>  - 위치 PID 튜닝")
+        print("    tune att <roll|pitch|yaw> <Kp> <Ki> <Kd>  - 자세 PID 튜닝")
+        print("    tune show                - 현재 PID 값 출력")
+        print("    debug on/off             - 고주사율 디버그 모드 토글")
         print("  [짐벌 제어]")
         print("    look <0-6>               - 지정 번호의 주시 타겟을 한번 바라봄")
         print("    look forward             - 짐벌 정면으로 초기화")
@@ -151,8 +273,12 @@ class InteractiveMissionNode(BaseMissionNode):
                 self._handle_moveto_command(cmd[1:])
             elif command == "head" and len(cmd) > 1:
                 self._handle_head_command(cmd[1])
-            elif command in ["fall", "dive"] and len(cmd) > 1:
+            elif command in ["fall", "fastfall", "dive"] and len(cmd) > 1:
                 self._handle_low_level_command(command, cmd[1:])
+            elif command == "tune" and len(cmd) > 1:
+                self._handle_tune_command(cmd[1:])
+            elif command == "debug" and len(cmd) > 1:
+                self._handle_debug_command(cmd[1])
             elif command == "look" and len(cmd) > 1:
                 self._handle_look_command(cmd[1])
             elif command == "stare" and len(cmd) > 1:
@@ -195,7 +321,8 @@ class InteractiveMissionNode(BaseMissionNode):
                 self.get_logger().info("사용자 명령: STOP. 모든 기동 정지.")
                 self.target_pose_map = copy.deepcopy(self.current_map_pose)
                 self.target_yaw_deg = None
-                self.maneuver_params = {} # 기동 파라미터 초기화
+                self.maneuver_params = {}  # 기동 파라미터 초기화
+                self.stop_high_frequency_control()  # 고주사율 제어 중지
                 self.state = "IDLE"
             else:
                 self.get_logger().warn("현재 위치를 알 수 없어 정지할 수 없음")
@@ -360,6 +487,13 @@ class InteractiveMissionNode(BaseMissionNode):
                 self.maneuver_params['target_altitude'] = float(args[0])
                 self.get_logger().info(f"수직 강하 시작! 목표 고도: {self.maneuver_params['target_altitude']:.2f}m")
                 
+            elif command == "fastfall":
+                if len(args) != 1:
+                    self.get_logger().error("사용법: fastfall <altitude>")
+                    return
+                self.maneuver_params['target_altitude'] = float(args[0])
+                self.get_logger().info(f"더 공격적인 자유낙하 시작! 목표 고도: {self.maneuver_params['target_altitude']:.2f}m")
+            
             elif command == "dive":
                 if len(args) != 2:
                     self.get_logger().error("사용법: dive <pitch> <altitude>")
@@ -369,10 +503,74 @@ class InteractiveMissionNode(BaseMissionNode):
                 self.get_logger().info(f"급강하 시작! 피치: {self.maneuver_params['target_pitch_deg']:.1f}도, 목표 고도: {self.maneuver_params['target_altitude']:.2f}m")
             
             self.state = "LOW_LEVEL_MANEUVER"
+            self.start_high_frequency_control()  # 100Hz 제어 시작
 
         except ValueError:
             self.get_logger().error(f"'{command}' 명령에 잘못된 숫자 인자가 주어졌습니다.")
             self.maneuver_params = {}
+    
+    def _handle_tune_command(self, args):
+        """PID 튜닝 명령 처리"""
+        if not args:
+            self.get_logger().error("사용법: tune <pos|att|show> ...")
+            return
+        
+        sub_cmd = args[0].lower()
+        
+        if sub_cmd == "show":
+            # 현재 PID 값 출력
+            self.get_logger().info("=== 현재 PID 파라미터 ===")
+            for axis, pid in self.high_freq_controller.pos_pids.items():
+                self.get_logger().info(f"위치 {axis}: Kp={pid.Kp:.2f}, Ki={pid.Ki:.3f}, Kd={pid.Kd:.2f}")
+            for axis, pid in self.high_freq_controller.att_pids.items():
+                self.get_logger().info(f"자세 {axis}: Kp={pid.Kp:.2f}, Ki={pid.Ki:.3f}, Kd={pid.Kd:.2f}")
+                
+        elif sub_cmd == "pos" and len(args) >= 5:
+            # 위치 PID 튜닝: tune pos x 0.8 0.1 0.2
+            try:
+                axis = args[1].lower()
+                kp, ki, kd = float(args[2]), float(args[3]), float(args[4])
+                
+                if axis in self.high_freq_controller.pos_pids:
+                    pid = self.high_freq_controller.pos_pids[axis]
+                    pid.Kp, pid.Ki, pid.Kd = kp, ki, kd
+                    pid.reset()  # PID 상태 초기화
+                    self.get_logger().info(f"위치 {axis} PID 업데이트: Kp={kp}, Ki={ki}, Kd={kd}")
+                else:
+                    self.get_logger().error(f"잘못된 축: {axis}. x, y, z 중 선택하세요.")
+                    
+            except ValueError:
+                self.get_logger().error("PID 값은 숫자여야 합니다.")
+                
+        elif sub_cmd == "att" and len(args) >= 5:
+            # 자세 PID 튜닝: tune att roll 2.0 0.0 0.5
+            try:
+                axis = args[1].lower()
+                kp, ki, kd = float(args[2]), float(args[3]), float(args[4])
+                
+                if axis in self.high_freq_controller.att_pids:
+                    pid = self.high_freq_controller.att_pids[axis]
+                    pid.Kp, pid.Ki, pid.Kd = kp, ki, kd
+                    pid.reset()  # PID 상태 초기화
+                    self.get_logger().info(f"자세 {axis} PID 업데이트: Kp={kp}, Ki={ki}, Kd={kd}")
+                else:
+                    self.get_logger().error(f"잘못된 축: {axis}. roll, pitch, yaw 중 선택하세요.")
+                    
+            except ValueError:
+                self.get_logger().error("PID 값은 숫자여야 합니다.")
+        else:
+            self.get_logger().error("사용법: tune pos <x|y|z> <Kp> <Ki> <Kd> 또는 tune att <roll|pitch|yaw> <Kp> <Ki> <Kd> 또는 tune show")
+    
+    def _handle_debug_command(self, arg):
+        """디버그 모드 토글"""
+        if arg.lower() == "on":
+            self.debug_mode = True
+            self.get_logger().info("고주사율 디버그 모드 활성화")
+        elif arg.lower() == "off":
+            self.debug_mode = False
+            self.get_logger().info("디버그 모드 비활성화")
+        else:
+            self.get_logger().error("사용법: debug on 또는 debug off")
     
     def _handle_look_command(self, sub_command):
         self.stare_target_index = None  # 'look' 명령은 항상 'stare'를 중지시킴
@@ -624,69 +822,21 @@ class InteractiveMissionNode(BaseMissionNode):
             self.state = "LANDED"
 
     def _handle_low_level_maneuver_state(self):
-        """저수준 동적 기동 상태를 처리 - 액추에이터 직접 제어"""
-        # 1. 액추에이터 직접 제어 모드 활성화 (모든 PX4 제어기 우회)
-        dcu.publish_offboard_control_mode(self, 
-                                          position=False, 
-                                          velocity=False, 
-                                          acceleration=False,
-                                          attitude=False, 
-                                          body_rate=False,
-                                          thrust_and_torque=False,
-                                          actuator=True)  # 액추에이터 직접 제어만 활성화
-
-        # 2. 기동 종류에 따라 모터 출력 계산
+        """저수준 동적 기동 상태 처리 - 100Hz 고주사율 제어"""
+        # 액추에이터 직접 제어 모드 활성화
+        dcu.publish_offboard_control_mode(self, actuator=True)
+        
+        # 기동 완료 조건 확인
         m_type = self.maneuver_params.get('type')
         target_altitude = self.maneuver_params.get('target_altitude')
         current_altitude = self.current_map_pose.pose.position.z
         
-        # 3. 기동 완료 조건 확인
         if current_altitude <= target_altitude + 0.5:
-            self.get_logger().info(f"{m_type} 기동 완료. 목표 고도 도달.")
+            self.get_logger().info(f"{m_type} 기동 완료. 고주사율 제어 중지.")
             self.target_pose_map = copy.deepcopy(self.current_map_pose)
             self.maneuver_params = {}
+            self.stop_high_frequency_control()
             self.state = "IDLE"
-            return
-            
-        # 4. 기동별 모터 출력 계산
-        if m_type == 'fall':
-            # 수직 자유낙하: 모터 출력을 극도로 감소
-            altitude_error = current_altitude - target_altitude
-            
-            if altitude_error > 10.0:
-                # 목표 고도까지 10m 이상 남았으면 거의 완전한 자유낙하
-                freefall_factor = 0.0  # 모터 출력 0% (완전 자유낙하)
-            elif altitude_error > 3.0:
-                # 3-10m 구간에서 점진적으로 모터 출력 증가 (감속 준비)
-                freefall_factor = (10.0 - altitude_error) / 7.0 * 0.2  # 0% → 20%
-            else:
-                # 3m 이내에서 강력한 감속 (안전한 착륙을 위해)
-                freefall_factor = 0.2 + (3.0 - altitude_error) / 3.0 * 0.6  # 20% → 80%
-                
-            motor_outputs = dcu.calculate_motor_outputs_for_freefall(
-                hover_thrust=0.5, 
-                freefall_factor=freefall_factor
-            )
-            
-            self.get_logger().info(f"FALL 실행중! 고도: {current_altitude:.1f}m → {target_altitude:.1f}m, 모터출력: {freefall_factor*100:.0f}%", 
-                                   throttle_duration_sec=0.3)
-            
-        elif m_type == 'dive':
-            # 급강하: 피치 각도에 따른 전진 급강하
-            pitch_deg = self.maneuver_params['target_pitch_deg']
-            # 피치 각도를 모터 출력 차이로 변환 (-90° = -1.0, 0° = 0.0, 90° = 1.0)
-            pitch_factor = pitch_deg / 90.0
-            
-            motor_outputs = dcu.calculate_motor_outputs_for_pitch(
-                hover_thrust=0.3,  # 급강하를 위해 기본 추력 감소
-                pitch_factor=pitch_factor
-            )
-            
-            self.get_logger().info(f"DIVE 실행중! 피치: {pitch_deg:.1f}도, 모터출력: {motor_outputs}", 
-                                   throttle_duration_sec=0.3)
-
-        # 5. 계산된 모터 출력 직접 발행 (모든 PX4 제한 우회!)
-        dcu.publish_actuator_motors(self, motor_outputs)
 
 
 def main(args=None):

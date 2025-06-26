@@ -164,6 +164,20 @@ class BaseMissionNode(Node, ABC):
         
         # 최종 목적지 (편의를 위한 별칭)
         self.final_destination = self.stare_targets[-1]
+        
+        # 특수 기동 웨이포인트 (fall, dive 등의 테스트용)
+        self.maneuver_waypoints = {
+            'freefall_test': [
+                [-95, 80, 25, 0, 'fall', 10],      # [x, y, z, yaw, maneuver_type, target_alt]
+                [-77, 80, 20, 0, 'fall', 8],
+                [-63, 75, 15, 0, 'fall', 5]
+            ],
+            'dive_test': [
+                [-95, 80, 25, 315, 'dive', 15, -30],  # [x, y, z, yaw, maneuver_type, target_alt, pitch]
+                [-77, 80, 20, 300, 'dive', 12, -45],
+                [-63, 75, 18, 180, 'dive', 8, -60]
+            ]
+        }
     
     # 공통 콜백 함수들
     

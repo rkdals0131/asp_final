@@ -6,13 +6,212 @@ PX4 오프보드 제어, 짐벌 제어, 좌표 변환 등의 공통 기능을 �
 
 import math
 import rclpy
+import time
 from px4_msgs.msg import VehicleCommand, OffboardControlMode, TrajectorySetpoint, VehicleAttitudeSetpoint, ActuatorMotors
 from geometry_msgs.msg import PoseStamped
 from rclpy.node import Node
 
 
-# === 각도 변환 유틸리티 함수들 ===
+# ============================================
+# 고주사율 저수준 제어 시스템
+# ============================================
 
+class SimplePID:
+    """간단한 PID 제어기 - 50-100Hz 고주사율 제어용"""
+    def __init__(self, Kp, Ki, Kd, setpoint, output_limits, windup_limit=None):
+        self.Kp, self.Ki, self.Kd = Kp, Ki, Kd
+        self.setpoint = setpoint
+        self.output_limits = output_limits
+        self.windup_limit = windup_limit or (output_limits[1] - output_limits[0]) * 0.1
+        
+        self.last_error = 0.0
+        self.integral = 0.0
+        self.last_time = None
+
+    def compute(self, current_value, current_time):
+        dt = (current_time - self.last_time).nanoseconds / 1e9 if self.last_time else 0.01
+        if dt <= 0:
+            self.last_time = current_time
+            return self.output_limits[0]
+
+        error = self.setpoint - current_value
+        
+        # P항
+        p_out = self.Kp * error
+        
+        # I항 (windup 방지)
+        if self.Ki > 0:
+            self.integral += error * dt
+            self.integral = max(-self.windup_limit, min(self.windup_limit, self.integral))
+            i_out = self.Ki * self.integral
+        else:
+            i_out = 0.0
+        
+        # D항
+        d_out = self.Kd * (error - self.last_error) / dt if dt > 0 else 0.0
+        
+        # 최종 출력
+        output = p_out + i_out + d_out
+        output = max(self.output_limits[0], min(self.output_limits[1], output))
+        
+        self.last_error = error
+        self.last_time = current_time
+        return output
+
+    def reset(self):
+        self.last_error = 0.0
+        self.integral = 0.0
+        self.last_time = None
+
+    def set_setpoint(self, new_setpoint):
+        self.setpoint = new_setpoint
+
+
+class HighFrequencyController:
+    """고주사율 저수준 제어기 - 위치/자세/모터 출력 통합 관리"""
+    def __init__(self):
+        # 위치 제어용 PID (X, Y, Z)
+        self.pos_pids = {
+            'x': SimplePID(0.8, 0.1, 0.2, 0.0, (-2.0, 2.0)),  # 수평 위치
+            'y': SimplePID(0.8, 0.1, 0.2, 0.0, (-2.0, 2.0)),
+            'z': SimplePID(1.2, 0.15, 0.3, 0.0, (-5.0, 5.0))  # 수직 위치 - 더 공격적
+        }
+        
+        # 자세 제어용 PID (Roll, Pitch, Yaw)
+        self.att_pids = {
+            'roll': SimplePID(2.0, 0.0, 0.5, 0.0, (-0.5, 0.5)),
+            'pitch': SimplePID(2.0, 0.0, 0.5, 0.0, (-0.5, 0.5)),
+            'yaw': SimplePID(1.5, 0.0, 0.3, 0.0, (-0.3, 0.3))
+        }
+        
+        # 모터 출력 계산
+        self.hover_thrust = 0.5  # 기본 호버링 추력
+        self.motor_mix = self._init_motor_mixing()
+        
+    def _init_motor_mixing(self):
+        """X500 쿼드콥터 모터 믹싱 행렬"""
+        # [thrust, roll, pitch, yaw] -> [m1, m2, m3, m4]
+        # m1: front_right, m2: back_left, m3: front_left, m4: back_right
+        return [
+            [1.0,  1.0,  1.0, -1.0],  # m1 (front_right)
+            [1.0, -1.0, -1.0, -1.0],  # m2 (back_left)  
+            [1.0, -1.0,  1.0,  1.0],  # m3 (front_left)
+            [1.0,  1.0, -1.0,  1.0]   # m4 (back_right)
+        ]
+    
+    def update_position_control(self, target_pos, current_pos, current_time):
+        """위치 제어 업데이트 - 목표 자세 출력"""
+        target_attitudes = {}
+        
+        # X, Y 위치 -> Roll, Pitch 자세 명령
+        for axis, pid in self.pos_pids.items():
+            if axis in ['x', 'y']:
+                pid.setpoint = target_pos[0 if axis == 'x' else 1]
+                current_val = current_pos[0 if axis == 'x' else 1]
+                attitude_cmd = pid.compute(current_val, current_time)
+                
+                # X 위치 오차 -> Pitch, Y 위치 오차 -> Roll (NED 좌표계)
+                if axis == 'x':
+                    target_attitudes['pitch'] = -attitude_cmd  # 전진을 위해 음수
+                else:
+                    target_attitudes['roll'] = attitude_cmd
+                    
+        # Z 위치 -> 직접 추력 제어
+        self.pos_pids['z'].setpoint = target_pos[2]
+        thrust_cmd = self.pos_pids['z'].compute(current_pos[2], current_time)
+        target_attitudes['thrust'] = self.hover_thrust + thrust_cmd
+        
+        return target_attitudes
+    
+    def update_attitude_control(self, target_att, current_att, current_time):
+        """자세 제어 업데이트 - 모터 출력 계산"""
+        motor_cmds = [0.0, 0.0, 0.0, 0.0]  # 4개 모터
+        
+        # 각 축별 자세 제어
+        att_outputs = {}
+        for axis in ['roll', 'pitch', 'yaw']:
+            if axis in target_att:
+                self.att_pids[axis].setpoint = target_att[axis]
+                att_outputs[axis] = self.att_pids[axis].compute(current_att[axis], current_time)
+            else:
+                att_outputs[axis] = 0.0
+        
+        # 추력 명령
+        thrust = target_att.get('thrust', self.hover_thrust)
+        
+        # 모터 믹싱: [thrust, roll, pitch, yaw] -> [m1, m2, m3, m4]
+        control_inputs = [thrust, att_outputs['roll'], att_outputs['pitch'], att_outputs['yaw']]
+        
+        for i, mix_row in enumerate(self.motor_mix):
+            motor_cmds[i] = sum(mix_row[j] * control_inputs[j] for j in range(4))
+            motor_cmds[i] = max(0.0, min(1.0, motor_cmds[i]))  # 0-1 범위 제한
+            
+        return motor_cmds
+
+
+class ManeuverCalculator:
+    """특수 기동 계산기 - fall, dive 등의 기동 경로 생성"""
+    
+    @staticmethod
+    def calculate_freefall_trajectory(current_alt, target_alt, current_time):
+        """자유낙하 궤적 계산 - 더 공격적인 낙하"""
+        alt_error = current_alt - target_alt
+        
+        if alt_error > 10.0:
+            # 10m 이상: 완전 자유낙하 (모터 거의 꺼짐)
+            return {'type': 'freefall', 'thrust_factor': 0.0}
+        elif alt_error > 4.0:
+            # 4-10m: 점진적 감속 준비 (매우 약한 추력)
+            factor = (alt_error - 4.0) / 6.0  # 1.0 → 0.0
+            return {'type': 'controlled_descent', 'thrust_factor': 0.05 * (1.0 - factor)}
+        elif alt_error > 1.5:
+            # 1.5-4m: 중간 감속 (안전한 착륙 준비)
+            factor = (alt_error - 1.5) / 2.5  # 1.0 → 0.0  
+            return {'type': 'safe_descent', 'thrust_factor': 0.05 + 0.25 * (1.0 - factor)}
+        else:
+            # 1.5m 이하: 강력한 감속 (착륙 안전)
+            factor = min(1.0, (1.5 - alt_error) / 1.5)
+            return {'type': 'landing', 'thrust_factor': 0.3 + 0.5 * factor}
+    
+    @staticmethod
+    def calculate_fastfall_trajectory(current_alt, target_alt, current_time):
+        """더 공격적인 자유낙하 궤적 계산 - 테스트용"""
+        alt_error = current_alt - target_alt
+        
+        if alt_error > 3.0:
+            # 3m 이상: 완전 자유낙하 (모터 완전 꺼짐)
+            return {'type': 'extreme_freefall', 'thrust_factor': 0.0}
+        elif alt_error > 1.0:
+            # 1-3m: 급속 감속
+            factor = (alt_error - 1.0) / 2.0  # 1.0 → 0.0
+            return {'type': 'rapid_decel', 'thrust_factor': 0.6 * (1.0 - factor)}
+        else:
+            # 1m 이하: 최대 감속 (충돌 방지)
+            return {'type': 'emergency_brake', 'thrust_factor': 1.0}
+    
+    @staticmethod
+    def calculate_dive_trajectory(pitch_deg, current_pos, target_alt, current_time):
+        """급강하 궤적 계산"""
+        pitch_rad = math.radians(pitch_deg)
+        
+        # 피치 각도에 따른 전진/하강 속도 분배
+        forward_factor = math.cos(pitch_rad)
+        down_factor = math.sin(pitch_rad)
+        
+        return {
+            'type': 'dive',
+            'pitch_target': pitch_rad,
+            'thrust_factor': 0.4,  # 급강하용 중간 추력
+            'forward_speed': 3.0 * forward_factor,
+            'down_speed': 3.0 * down_factor
+        }
+
+
+# ============================================
+# 기존 유틸리티 함수들 (단순화)
+# ============================================
+
+# === 각도 변환 함수들 ===
 def degrees_to_radians(degrees):
     """
     도(degree)를 라디안으로 변환합니다.
