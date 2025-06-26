@@ -79,10 +79,10 @@ class WaypointMissionNode(BaseMissionNode):
         
         # 자유낙하 파라미터 (고도 기반, 단계별)
         self.freefall_altitude_drop = 2.0  # 총 낙하 거리
-        self.freefall_stage1_drop = 0.8    # 1단계: 0.0 추력으로 0.8m 하강
-        self.freefall_stage2_drop = 0.4    # 2단계: 0.1 추력으로 0.4m 하강  
-        self.freefall_stage3_drop = 0.8    # 3단계: 0.3 추력으로 0.8m 하강
-        self.stabilization_duration = 2.0  # 안정화 시간 2.0초
+        self.freefall_stage1_drop = 0.9    # 1단계: 0.0 추력으로 0.8m 하강
+        self.freefall_stage2_drop = 0.2    # 2단계: 0.1 추력으로 0.4m 하강  
+        self.freefall_stage3_drop = 0.9    # 3단계: 0.3 추력으로 0.8m 하강
+        self.stabilization_duration = 3.141592  # 안정화 시간 2.0초
         
         self.landing_marker_pose = None
         self.last_marker_detection_time = None
@@ -98,8 +98,7 @@ class WaypointMissionNode(BaseMissionNode):
         self.motors_disabled = False        # 모터 비활성화 여부
         self.velocity_threshold = 0.5       # 속도 임계값 (m/s)
         
-        # WP8→WP9 이동 중 안정화를 위한 변수
-        self.wp8_to_wp9_stabilization_done = False  # WP8→WP9 이동 중 안정화 완료 여부
+
         
         # PX4 상태 모니터링 변수
         self.is_offboard_enabled = False    # Offboard 모드 활성화 여부
@@ -388,7 +387,7 @@ class WaypointMissionNode(BaseMissionNode):
     def _handle_takeoff_state(self):
         """이륙 상태 처리"""
         if self.current_map_pose:
-            takeoff_altitude = 5.5
+            takeoff_altitude = 10.0
             target_pos = [
                 self.current_map_pose.pose.position.x,
                 self.current_map_pose.pose.position.y,
@@ -396,8 +395,8 @@ class WaypointMissionNode(BaseMissionNode):
             ]
             self.publish_position_setpoint(target_pos)
             
-            if abs(self.current_map_pose.pose.position.z - takeoff_altitude) < 1.0:
-                self.get_logger().info(f"이륙 완료. 첫 번째 웨이포인트 {self.current_waypoint_index}로 이동")
+            if abs(self.current_map_pose.pose.position.z - takeoff_altitude) < 3.5:
+                self.get_logger().info(f"이륙 완료. 첫 번째 웨이포인트 {self.current_waypoint_index}로 바로출동!")
                 # 미션 컨트롤에 이륙 완료 신호 전송
                 self.send_mission_complete(4) # DRONE_TAKEOFF_COMPLETE
                 self.state = "MOVING_TO_WAYPOINT"
@@ -438,6 +437,8 @@ class WaypointMissionNode(BaseMissionNode):
                         # 자유낙하 시작 고도 기록
                         if self.current_map_pose:
                             self.freefall_start_altitude = self.current_map_pose.pose.position.z
+                        # 자유낙하 시작과 함께 짐벌을 아래로 고정
+                        dcu.point_gimbal_down(self)
                         self.motors_disabled = False  # 플래그 초기화
                         return
                     else:
@@ -470,13 +471,6 @@ class WaypointMissionNode(BaseMissionNode):
                 return
             
             self.get_logger().info(f"웨이포인트 {target_wp_index} 통과.")
-            
-            # WP8 도착 후 WP9로 이동하기 전에 안정화 단계 추가
-            if target_wp_index == 8 and not self.wp8_to_wp9_stabilization_done:
-                self.get_logger().info("WP8 도착. WP9로 이동하기 전 1.5초 안정화 시작.")
-                self.state = "STABILIZING"
-                self.stabilization_start_time = self.get_clock().now()
-                return  # 웨이포인트 인덱스는 아직 증가시키지 않음
             
             self.current_waypoint_index += 1
 
@@ -511,14 +505,11 @@ class WaypointMissionNode(BaseMissionNode):
         if elapsed_time >= self.stabilization_duration:
             self.get_logger().info("안정화 완료. 다음 단계로 진행합니다.")
             
-            # 자유낙하 후 안정화였다면 WP8로, WP8 후 안정화였다면 WP9로
+            # 자유낙하 후 안정화만 처리 (WP7→WP8)
             if self.current_waypoint_index == 7:  # 자유낙하는 WP7에서 시작
                 self.current_waypoint_index = 8  # WP8로 이동
                 self.wp7_arrival_detected = False  # 플래그 리셋
                 self.freefall_start_altitude = None  # 자유낙하 고도 리셋
-            elif self.current_waypoint_index == 8:  # WP8에서 안정화 완료
-                self.current_waypoint_index += 1  # WP9로 이동
-                self.wp8_to_wp9_stabilization_done = True
             
             self.state = "MOVING_TO_WAYPOINT"
 

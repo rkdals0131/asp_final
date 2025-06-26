@@ -33,10 +33,10 @@ class PathFollowerNode(Node):
     def __init__(self):
         super().__init__('path_follower_node')
 
-        # === 핵심 파라미터 ===
+        # === 핵심 파라미터 (하드코딩된 기본값) ===
         self.declare_parameter('max_jerk_with_drone', 2.0)
         self.declare_parameter('max_jerk_default', 4.0)
-        self.declare_parameter('max_accel_with_drone', 1.0)
+        self.declare_parameter('max_accel_with_drone', 0.8)
         self.declare_parameter('max_accel_default', 4.0)
 
         self.declare_parameter('lookahead_k', 0.9)
@@ -45,14 +45,18 @@ class PathFollowerNode(Node):
         self.declare_parameter('max_speed', 7.0)
         self.declare_parameter('min_speed', 0.5)
         self.declare_parameter('max_decel', 1.0)
-        self.declare_parameter('max_lateral_accel', 2.0)
+        self.declare_parameter('max_lateral_accel', 2.5)
         self.declare_parameter('waypoint_reach_threshold', 1.5)
         self.declare_parameter('path_density', 0.1)
         self.declare_parameter('map_frame', 'map')
         self.declare_parameter('vehicle_base_frame', 'X1_asp')
         
-        # === 경로 로딩 파라미터 ===
-        self.declare_parameter('waypoint_file', '')
+        # === 경로 로딩 파라미터 (하드코딩된 기본값) ===
+        # 패키지 루트 디렉토리 계산
+        package_root = os.path.join(os.path.dirname(__file__), '..', '..')
+        default_waypoint_file = os.path.join(package_root, 'config', 'ugv_wp.csv')
+        
+        self.declare_parameter('waypoint_file', default_waypoint_file)
         self.declare_parameter('use_mission_ids', True)
 
         # 파라미터 로딩
@@ -495,6 +499,7 @@ class PathFollowerNode(Node):
 
 def main(args=None):
     rclpy.init(args=args)
+    
     try:
         node = PathFollowerNode()
         rclpy.spin(node)

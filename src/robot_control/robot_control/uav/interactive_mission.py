@@ -530,6 +530,11 @@ class InteractiveMissionNode(BaseMissionNode):
             self._handle_low_level_maneuver_state()
             return
 
+        # Offboard Control Mode 전송 (LANDING, LANDED, INIT, DISARMED 제외한 모든 상태)
+        # ARMED_IDLE 상태에서도 Offboard 모드 유지를 위해 신호 전송
+        if self.state not in ["LANDING", "LANDED", "INIT", "DISARMED"]:
+            dcu.publish_offboard_control_mode(self)
+
         # Stare 모드 실행
         if self.stare_target_index is not None and self.state in ["IDLE", "MOVING"]:
             self.point_gimbal_at_target(self.stare_targets[self.stare_target_index])
@@ -538,7 +543,9 @@ class InteractiveMissionNode(BaseMissionNode):
         self._publish_all_markers()
         
         # 미션별 상태 처리
-        if self.state == "TAKING_OFF":
+        if self.state == "ARMED_IDLE":
+            self._handle_armed_idle_state()
+        elif self.state == "TAKING_OFF":
             self._handle_takeoff_state()
         elif self.state == "MOVING":
             self._handle_moving_state()
@@ -553,21 +560,31 @@ class InteractiveMissionNode(BaseMissionNode):
         """이륙 상태 처리"""
         if self.takeoff_target_local is None:
             self.get_logger().info(f"이륙 시작. 목표 고도: {self.takeoff_altitude}m.")
-            self.takeoff_target_local = [
-                self.current_local_pos.x,
-                self.current_local_pos.y,
-                self.current_local_pos.z - self.takeoff_altitude
-            ]
+            if self.current_map_pose:
+                # map 좌표계 기준으로 이륙 목표 설정
+                target_map_pos = [
+                    self.current_map_pose.pose.position.x,
+                    self.current_map_pose.pose.position.y,
+                    self.takeoff_altitude
+                ]
+                # map 좌표를 이용한 position setpoint 전송
+                self.publish_position_setpoint(target_map_pos)
+                self.takeoff_target_local = True  # 플래그로만 사용
+            else:
+                self.get_logger().warn("현재 위치 정보가 없어 이륙할 수 없습니다.")
+                return
+        else:
+            # 지속적으로 이륙 목표 전송
+            if self.current_map_pose:
+                target_map_pos = [
+                    self.current_map_pose.pose.position.x,
+                    self.current_map_pose.pose.position.y,
+                    self.takeoff_altitude
+                ]
+                self.publish_position_setpoint(target_map_pos)
         
-        # 이륙 세트포인트 퍼블리시
-        sp_msg = TrajectorySetpoint(
-            position=[float(p) for p in self.takeoff_target_local],
-            timestamp=int(self.get_clock().now().nanoseconds / 1000)
-        )
-        self.trajectory_setpoint_publisher.publish(sp_msg)
-        
-        # 이륙 완료 확인
-        if abs(self.current_local_pos.z - self.takeoff_target_local[2]) < 1.0:
+        # 이륙 완료 확인 (map 좌표계 기준)
+        if self.current_map_pose and abs(self.current_map_pose.pose.position.z - self.takeoff_altitude) < 1.0:
             self.get_logger().info("이륙 완료. 호버링 상태.")
             self.target_pose_map = copy.deepcopy(self.current_map_pose)
             self.state = "IDLE"
@@ -610,6 +627,16 @@ class InteractiveMissionNode(BaseMissionNode):
             if yaw_error < 5.0: # 5도 이내 오차
                 self.get_logger().info(f"방향 회전 완료 ({self.target_yaw_deg:.0f}도). 호버링 상태.")
                 self.state = "IDLE"
+
+    def _handle_armed_idle_state(self):
+        """ARM 후 대기 상태 처리 - Offboard 모드 유지를 위해 현재 위치 setpoint 전송"""
+        if self.current_map_pose:
+            current_pos = [
+                self.current_map_pose.pose.position.x,
+                self.current_map_pose.pose.position.y,
+                self.current_map_pose.pose.position.z
+            ]
+            self.publish_position_setpoint(current_pos)
 
     def _handle_idle_state(self):
         """대기 상태 처리"""

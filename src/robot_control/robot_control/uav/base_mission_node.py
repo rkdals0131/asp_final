@@ -129,16 +129,17 @@ class BaseMissionNode(Node, ABC):
         # 미션 정의: (x, y, z, yaw, stare_index)
         # yaw는 맵 좌표계 기준 (X축이 0도, 반시계방향이 양수)
         self.mission_definition = [
-            (-95, 80, 17, 315, 0),  
-            (-77.5, 80, 31.5, 300, 1),  
+            (-95, 80, 17.5, 280, 0),  
+            (-74, 82, 31.5, 300, 1),  
             (-59, 73.5, 20, 180, 2),    
             (-70, 105, 15.5, 160, 3),  
             (-90, 100, 17, 170, 4),  
             (-93, 96, 22.5, 170, 5),  
-            (-100.5, 95, 30.5, 170, 6),  
+            (-100.5, 95, 29.3, 170, 6),  
             (-58, 105, 26, 270, 7),
-            (-58.6811, 105.322, 5, 151.43, 8), 
-            (-58.6811, 105.322, 3.29868, 151.43, 8),  
+            #(-58, 105, 6, 270, 8),
+            #(-58.6811, 105.322, 5, 151.43, 8), 
+            (-58.6811, 105.322, 3.141592, 151.43, 8),  
         ]
         
         # 드론 웨이포인트 (x, y, z 좌표만 추출)
@@ -199,28 +200,43 @@ class BaseMissionNode(Node, ABC):
         Returns:
             bool: TF 조회 성공 여부
         """
-        try:
-            # TF lookup용 완전한 프레임 ID 구성 (base_link 접미사 추가)
-            full_drone_frame_id = f"{self.drone_frame_id}/base_link"
-            trans = self.tf_buffer.lookup_transform('map', full_drone_frame_id, rclpy.time.Time())
-            
-            if self.current_map_pose is None:
-                self.current_map_pose = PoseStamped()
-            
-            self.current_map_pose.pose.position.x = trans.transform.translation.x
-            self.current_map_pose.pose.position.y = trans.transform.translation.y
-            self.current_map_pose.pose.position.z = trans.transform.translation.z
-            self.current_map_pose.pose.orientation = trans.transform.rotation
-            
-            return True
-            
-        except TransformException as e:
-            if self.state != "INIT":
-                self.get_logger().warn(
-                    f"TF lookup failed for '{full_drone_frame_id}': {e}", 
-                    throttle_duration_sec=1.0
-                )
-            return False
+        # 시도할 프레임 ID 목록 (가장 일반적인 것부터 시도)
+        candidate_frames = [
+            f"{self.drone_frame_id}/base_link",
+            f"{self.drone_frame_id}",
+            "x500_gimbal_0/base_link", 
+            "x500_gimbal_0"
+        ]
+        
+        for frame_id in candidate_frames:
+            try:
+                trans = self.tf_buffer.lookup_transform('map', frame_id, rclpy.time.Time())
+                
+                if self.current_map_pose is None:
+                    self.current_map_pose = PoseStamped()
+                
+                self.current_map_pose.pose.position.x = trans.transform.translation.x
+                self.current_map_pose.pose.position.y = trans.transform.translation.y
+                self.current_map_pose.pose.position.z = trans.transform.translation.z
+                self.current_map_pose.pose.orientation = trans.transform.rotation
+                
+                # 성공적으로 찾은 프레임 ID를 업데이트
+                if hasattr(self, '_working_frame_id') and self._working_frame_id != frame_id:
+                    self.get_logger().info(f"TF 프레임 변경: {getattr(self, '_working_frame_id', 'unknown')} -> {frame_id}")
+                self._working_frame_id = frame_id
+                
+                return True
+                
+            except TransformException:
+                continue
+        
+        # 모든 후보 프레임에서 실패한 경우
+        if self.state != "INIT":
+            self.get_logger().warn(
+                f"모든 TF 프레임 조회 실패. 시도한 프레임: {candidate_frames}", 
+                throttle_duration_sec=2.0
+            )
+        return False
     
     # 상태 머신 관련 메서드
     
@@ -369,6 +385,8 @@ class BaseMissionNode(Node, ABC):
             self.handshake_counter = 0
             self.offboard_ready = False
             self.arm_ready = False
+            # Offboard 모드 즉시 활성화 시작
+            dcu.publish_offboard_control_mode(self)
             self.state = "HANDSHAKE"
         else:
             self.get_logger().warn(f"미션을 시작할 수 없음. 현재 상태: {self.state}")
