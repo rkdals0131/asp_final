@@ -60,12 +60,12 @@ class WaypointMissionNode(BaseMissionNode):
         
         # 정밀 착륙 관련 변수 및 파라미터
         self.declare_parameter('landing_altitude', 0.5)
-        self.declare_parameter('descent_speed', 2.5, 
+        self.declare_parameter('descent_speed', 4.0, 
             ParameterDescriptor(description="마커 정렬 후 최종 착륙 시 하강 속도 (m/s)"))
         self.declare_parameter('horizontal_tolerance', 0.15)
         self.declare_parameter('vertical_tolerance', 0.3)
         self.declare_parameter('landing_marker_id', 10)  # 착륙용 마커 ID
-        self.declare_parameter('search_descent_speed', 3.0, 
+        self.declare_parameter('search_descent_speed', 4.0, 
             ParameterDescriptor(description="마커를 탐색하며 하강할 때의 속도 (m/s)"))
         self.declare_parameter('precision_horizontal_tolerance', 0.1)  # 정밀 착륙 시 수평 허용 오차
         
@@ -77,9 +77,12 @@ class WaypointMissionNode(BaseMissionNode):
         self.search_descent_speed = self.get_parameter('search_descent_speed').value
         self.precision_horizontal_tolerance = self.get_parameter('precision_horizontal_tolerance').value
         
-        # 자유낙하 파라미터 (고도 기반)
-        self.freefall_altitude_drop = 2.0  
-        self.stabilization_duration = 3.0  # 자유낙하 후 안정화 시간 5초
+        # 자유낙하 파라미터 (고도 기반, 단계별)
+        self.freefall_altitude_drop = 2.0  # 총 낙하 거리
+        self.freefall_stage1_drop = 0.8    # 1단계: 0.0 추력으로 0.8m 하강
+        self.freefall_stage2_drop = 0.4    # 2단계: 0.1 추력으로 0.4m 하강  
+        self.freefall_stage3_drop = 0.8    # 3단계: 0.3 추력으로 0.8m 하강
+        self.stabilization_duration = 2.0  # 안정화 시간 2.0초
         
         self.landing_marker_pose = None
         self.last_marker_detection_time = None
@@ -94,6 +97,9 @@ class WaypointMissionNode(BaseMissionNode):
         self.wp7_arrival_detected = False   # WP7 도착 감지
         self.motors_disabled = False        # 모터 비활성화 여부
         self.velocity_threshold = 0.5       # 속도 임계값 (m/s)
+        
+        # WP8→WP9 이동 중 안정화를 위한 변수
+        self.wp8_to_wp9_stabilization_done = False  # WP8→WP9 이동 중 안정화 완료 여부
         
         # PX4 상태 모니터링 변수
         self.is_offboard_enabled = False    # Offboard 모드 활성화 여부
@@ -393,7 +399,7 @@ class WaypointMissionNode(BaseMissionNode):
             if abs(self.current_map_pose.pose.position.z - takeoff_altitude) < 1.0:
                 self.get_logger().info(f"이륙 완료. 첫 번째 웨이포인트 {self.current_waypoint_index}로 이동")
                 # 미션 컨트롤에 이륙 완료 신호 전송
-                self.send_mission_complete(2) # DRONE_TAKEOFF_COMPLETE
+                self.send_mission_complete(4) # DRONE_TAKEOFF_COMPLETE
                 self.state = "MOVING_TO_WAYPOINT"
     
     def _handle_moving_to_waypoint_state(self):
@@ -401,7 +407,7 @@ class WaypointMissionNode(BaseMissionNode):
         if self.current_waypoint_index >= len(self.drone_waypoints):
             self.get_logger().info("모든 웨이포인트 방문 완료. 최종 지점에서 착륙 명령 대기")
             self.state = "AWAITING_LANDING_COMMAND"
-            self.send_mission_complete(4)  # DRONE_APPROACH_COMPLETE
+            self.send_mission_complete(5)  # DRONE_APPROACH_COMPLETE
             return
 
         target_wp_index = self.current_waypoint_index
@@ -427,7 +433,7 @@ class WaypointMissionNode(BaseMissionNode):
                     if self.is_offboard_enabled and self.is_armed:
                         self.get_logger().info("속도가 임계값 이하로 감소! 자유낙하 시작!")
                         # WP7에서 자유낙하 시작 시 미션 완료 신호 전송
-                        self.send_mission_complete(6) # DRONE_WP8_ARRIVAL (자유낙하 시작 신호)
+                        self.send_mission_complete(7) # DRONE_WP8_ARRIVAL (자유낙하 시작 신호)
                         self.state = "FREEFALLING"
                         # 자유낙하 시작 고도 기록
                         if self.current_map_pose:
@@ -464,19 +470,27 @@ class WaypointMissionNode(BaseMissionNode):
                 return
             
             self.get_logger().info(f"웨이포인트 {target_wp_index} 통과.")
+            
+            # WP8 도착 후 WP9로 이동하기 전에 안정화 단계 추가
+            if target_wp_index == 8 and not self.wp8_to_wp9_stabilization_done:
+                self.get_logger().info("WP8 도착. WP9로 이동하기 전 1.5초 안정화 시작.")
+                self.state = "STABILIZING"
+                self.stabilization_start_time = self.get_clock().now()
+                return  # 웨이포인트 인덱스는 아직 증가시키지 않음
+            
             self.current_waypoint_index += 1
 
             # 마지막 웨이포인트였는지 확인
             if self.current_waypoint_index >= len(self.drone_waypoints):
                 self.get_logger().info("모든 웨이포인트 방문 완료. 최종 지점에서 착륙 명령 대기")
                 self.state = "AWAITING_LANDING_COMMAND"
-                self.send_mission_complete(4)  # DRONE_APPROACH_COMPLETE
+                self.send_mission_complete(5)  # DRONE_APPROACH_COMPLETE
             else:
                 # 다음 웨이포인트로 계속 진행 (상태는 MOVING_TO_WAYPOINT 유지)
                 self.get_logger().info(f"다음 웨이포인트로 이동: {self.current_waypoint_index}")
     
     def _handle_stabilizing_state(self):
-        """자유낙하 후 안정화 상태. 모터를 강제로 켜고 현재 위치에서 호버링"""
+        """안정화 상태. 1.5초 호버링 후 다음 단계로 진행"""
         # 모터 강제 재활성화 및 Offboard Control Mode 발행
         dcu.publish_offboard_control_mode(self)
         
@@ -491,14 +505,21 @@ class WaypointMissionNode(BaseMissionNode):
         
         # 안정화 시간 확인
         elapsed_time = (self.get_clock().now() - self.stabilization_start_time).nanoseconds / 1e9
-        self.get_logger().info(f"자유낙하 후 안정화 중... ({elapsed_time:.1f}/2.0s)", 
+        self.get_logger().info(f"안정화 중... ({elapsed_time:.1f}/{self.stabilization_duration}s)", 
                               throttle_duration_sec=0.5)
         
         if elapsed_time >= self.stabilization_duration:
-            self.get_logger().info("안정화 완료. WP8로 이동합니다.")
-            self.current_waypoint_index = 8  # 다음 목표는 WP8 (WP7에서 자유낙하했으므로)
-            self.wp7_arrival_detected = False  # 플래그 리셋
-            self.freefall_start_altitude = None  # 자유낙하 고도 리셋
+            self.get_logger().info("안정화 완료. 다음 단계로 진행합니다.")
+            
+            # 자유낙하 후 안정화였다면 WP8로, WP8 후 안정화였다면 WP9로
+            if self.current_waypoint_index == 7:  # 자유낙하는 WP7에서 시작
+                self.current_waypoint_index = 8  # WP8로 이동
+                self.wp7_arrival_detected = False  # 플래그 리셋
+                self.freefall_start_altitude = None  # 자유낙하 고도 리셋
+            elif self.current_waypoint_index == 8:  # WP8에서 안정화 완료
+                self.current_waypoint_index += 1  # WP9로 이동
+                self.wp8_to_wp9_stabilization_done = True
+            
             self.state = "MOVING_TO_WAYPOINT"
 
     def _handle_freefall_state(self):
@@ -518,13 +539,30 @@ class WaypointMissionNode(BaseMissionNode):
             self.get_logger().info("모터 강제 비활성화! 자유낙하 시작")
             self.motors_disabled = True
 
-        # 모터 정지 명령 지속적 전송 (failsafe 방지) - 100Hz로 실행됨
-        dcu.publish_actuator_motors(self, [0.0, 0.0, 0.0, 0.0])
-
-        # 고도 확인 (3.89m 하강 시 모터 재활성화) - 100Hz로 실시간 체크
+        # 고도 확인 및 단계별 모터 제어 - 100Hz로 실시간 체크
         if self.current_map_pose and self.freefall_start_altitude is not None:
             current_altitude = self.current_map_pose.pose.position.z
             altitude_dropped = self.freefall_start_altitude - current_altitude
+            
+            # 단계별 모터 출력 결정
+            if altitude_dropped < self.freefall_stage1_drop:
+                # 1단계: 0.0 추력으로 0.8m 하강
+                motor_output = 0.0
+                stage_info = f"1단계 (0.0 추력): {altitude_dropped:.2f}/{self.freefall_stage1_drop}m"
+            elif altitude_dropped < (self.freefall_stage1_drop + self.freefall_stage2_drop):
+                # 2단계: 0.1 추력으로 0.4m 하강
+                motor_output = 0.1
+                stage_info = f"2단계 (0.1 추력): {altitude_dropped:.2f}/{self.freefall_stage1_drop + self.freefall_stage2_drop}m"
+            elif altitude_dropped < self.freefall_altitude_drop:
+                # 3단계: 0.3 추력으로 0.8m 하강
+                motor_output = 0.3
+                stage_info = f"3단계 (0.3 추력): {altitude_dropped:.2f}/{self.freefall_altitude_drop}m"
+            else:
+                motor_output = 0.0  # 안전장치
+                stage_info = f"완료: {altitude_dropped:.2f}m"
+            
+            # 모터 출력 전송
+            dcu.publish_actuator_motors(self, [motor_output, motor_output, motor_output, motor_output])
             
             # 100Hz 고속 체크, 로그만 5Hz로 출력
             if not hasattr(self, '_freefall_log_counter'):
@@ -533,7 +571,7 @@ class WaypointMissionNode(BaseMissionNode):
             
             # 20카운트마다 로그 출력 (100Hz / 20 = 5Hz)
             if self._freefall_log_counter % 20 == 0:
-                self.get_logger().info(f"자유낙하 중... (하강: {altitude_dropped:.2f}m / 목표: {self.freefall_altitude_drop}m) | Offboard: {self.is_offboard_enabled}")
+                self.get_logger().info(f"자유낙하 {stage_info} | Offboard: {self.is_offboard_enabled}")
             
             # 실제 조건 체크는 매 100Hz마다 수행 (즉시 반응)
             if altitude_dropped >= self.freefall_altitude_drop:
@@ -543,6 +581,8 @@ class WaypointMissionNode(BaseMissionNode):
                 self.motors_disabled = False  # 모터 다시 활성화 표시
                 self._freefall_log_counter = 0  # 카운터 리셋
         else:
+            # 고도 정보가 없으면 기본값
+            dcu.publish_actuator_motors(self, [0.0, 0.0, 0.0, 0.0])
             self.get_logger().warn("고도 정보가 없어 자유낙하를 정상적으로 처리할 수 없습니다.", throttle_duration_sec=1.0)
 
     def _handle_awaiting_landing_command_state(self):
@@ -621,7 +661,7 @@ class WaypointMissionNode(BaseMissionNode):
             
         super().on_mission_complete()
         self.get_logger().info("웨이포인트 미션이 성공적으로 완료되었습니다!")
-        self.send_mission_complete(5) # DRONE_HOVER_COMPLETE (미션 완료 신호)
+        self.send_mission_complete(6) # DRONE_HOVER_COMPLETE (미션 완료 신호)
 
 
 def main(args=None):

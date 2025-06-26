@@ -75,12 +75,13 @@ class SimpleMissionControl(Node):
 
         # 미션 단계별 ID 정의
         self.MISSION_IDS = {
-            'UGV_TAKEOFF_ARRIVAL': 1,
-            'DRONE_TAKEOFF_COMPLETE': 2,
-            'UGV_MISSION_COMPLETE': 3,
-            'DRONE_APPROACH_COMPLETE': 4,
-            'DRONE_HOVER_COMPLETE': 5,
-            'DRONE_WP8_ARRIVAL': 6
+            'UGV_ARM_POSITION_ARRIVAL': 1,  # mission_type 1 도달 시 드론 ARM
+            'UGV_TAKEOFF_ARRIVAL': 2,       # mission_type 2 도달 시 드론 takeoff
+            'UGV_MISSION_COMPLETE': 3,      # UGV 미션 완료
+            'DRONE_TAKEOFF_COMPLETE': 4,    # 드론 이륙 완료
+            'DRONE_APPROACH_COMPLETE': 5,   # 드론 접근 완료
+            'DRONE_HOVER_COMPLETE': 6,      # 드론 호버링 완료
+            'DRONE_WP8_ARRIVAL': 7          # 드론 WP8 도달
         }
 
         # 상태 변수
@@ -243,11 +244,17 @@ class SimpleMissionControl(Node):
         
         # 상태 전이 로직을 단순한 매핑으로 정리
         state_transitions = {
-            self.MISSION_IDS['UGV_TAKEOFF_ARRIVAL']: {
+            self.MISSION_IDS['UGV_ARM_POSITION_ARRIVAL']: {
                 'expected_states': ['UGV_TO_TAKEOFF'],
                 'next_state': 'DRONE_ARMING',
                 'action': lambda: self.drone_command_pub.publish(String(data='start')),
-                'message': "UGV가 이륙 위치에 도착. 드론 시작 명령 전송"
+                'message': "UGV가 ARM 위치에 도착. 드론 ARM 명령 전송"
+            },
+            self.MISSION_IDS['UGV_TAKEOFF_ARRIVAL']: {
+                'expected_states': ['DRONE_ARMING', 'DRONE_TAKEOFF'],
+                'next_state': 'DRONE_TAKEOFF',
+                'action': lambda: self.drone_command_pub.publish(String(data='takeoff')),
+                'message': "UGV가 이륙 위치에 도착. 드론 즉시 takeoff 명령 전송"
             },
             self.MISSION_IDS['DRONE_TAKEOFF_COMPLETE']: {
                 'expected_states': ['DRONE_ARMING', 'DRONE_TAKEOFF'],
