@@ -66,13 +66,13 @@ class BaseMissionNode(Node, ABC):
             OffboardControlMode, "/fmu/in/offboard_control_mode", 10
         )
         self.trajectory_setpoint_publisher = self.create_publisher(
-            TrajectorySetpoint, "/fmu/in/trajectory_setpoint", 10
+            TrajectorySetpoint, "/fmu/in/trajectory_setpoint", self.qos_profile
         )
         self.attitude_setpoint_publisher = self.create_publisher(
-            VehicleAttitudeSetpoint, "/fmu/in/vehicle_attitude_setpoint", 10
+            VehicleAttitudeSetpoint, "/fmu/in/vehicle_attitude_setpoint", self.qos_profile
         )
         self.actuator_motors_publisher = self.create_publisher(
-            ActuatorMotors, "/fmu/in/actuator_motors", 10
+            ActuatorMotors, "/fmu/in/actuator_motors", self.qos_profile
         )
         self.vehicle_command_publisher = self.create_publisher(
             VehicleCommand, "/fmu/in/vehicle_command", 10
@@ -128,15 +128,15 @@ class BaseMissionNode(Node, ABC):
         # yaw는 맵 좌표계 기준 (X축이 0도, 반시계방향이 양수)
         self.mission_definition = [
             (-95, 80, 17, 315, 0),  
-            (-77, 80, 30, 300, 1),  
+            (-77, 80, 31, 300, 1),  
             (-63, 75, 25, 180, 2),  
             (-55, 72, 15, 180, 3),  
-            (-70, 100, 12, 160, 4),  
+            (-70, 105, 12, 160, 4),  
             (-90, 100, 17, 170, 5),  
             (-93, 96, 22, 170, 6),  
             (-100, 95, 30, 170, 7),  
-            (-63, 100, 20, 270, 8),
-            (-63, 100, 6, 270, 9),  
+            (-63, 100, 27, 270, 8),
+            (-63, 100, 5, 270, 9),  
         ]
         
         # 드론 웨이포인트 (x, y, z 좌표만 추출)
