@@ -291,7 +291,7 @@ if __name__ == "__main__":
     
     # 실제 사용 예제 (파일에서 읽기)
     target_distance = 19.0  # 원하는 추락 거리 (미터)
-    df = pd.read_csv('/home/user1/ASP_Workspace/asp_ros2_ws/calibration_results/20250627_011430_12131.csv')
+    df = pd.read_csv('/home/user1/ASP_Workspace/asp_ros2_ws/calibration_results/20250627_000057_123.csv')
     analyzed_df, fall_segments, total_fall_dist, total_fall_time = analyze_drone_data(df, target_distance)
     plot_drone_data(analyzed_df, fall_segments)
     

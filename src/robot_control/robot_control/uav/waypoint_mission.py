@@ -13,7 +13,7 @@ import copy
 from std_msgs.msg import String, Header
 from vision_msgs.msg import Detection3DArray
 from visualization_msgs.msg import Marker, MarkerArray
-from px4_msgs.msg import VehicleLandDetected  # 착륙 감지 메시지
+from px4_msgs.msg import VehicleLandDetected, VehicleControlMode, VehicleStatus  # 착륙 감지 및 제어 상태 메시지
 from mission_admin_interfaces.srv import MissionComplete
 from rcl_interfaces.msg import ParameterDescriptor
 
@@ -40,6 +40,12 @@ class WaypointMissionNode(BaseMissionNode):
         # PX4 상태 구독자
         self.land_detector_sub = self.create_subscription(
             VehicleLandDetected, "/fmu/out/vehicle_land_detected", self._land_detected_callback, self.qos_profile
+        )
+        self.vehicle_control_mode_sub = self.create_subscription(
+            VehicleControlMode, "/fmu/out/vehicle_control_mode", self._vehicle_control_mode_callback, self.qos_profile
+        )
+        self.vehicle_status_sub = self.create_subscription(
+            VehicleStatus, "/fmu/out/vehicle_status", self._vehicle_status_callback, self.qos_profile
         )
         
         # 미션 컨트롤 서비스 클라이언트
@@ -71,19 +77,27 @@ class WaypointMissionNode(BaseMissionNode):
         self.search_descent_speed = self.get_parameter('search_descent_speed').value
         self.precision_horizontal_tolerance = self.get_parameter('precision_horizontal_tolerance').value
         
-        # 자유낙하 파라미터
-        self.declare_parameter('freefall_duration', 1.05, 
-            ParameterDescriptor(description="WP8에서 WP9로 이동 시 자유낙하 지속 시간 (초)"))
-        self.freefall_duration = self.get_parameter('freefall_duration').value
+        # 자유낙하 파라미터 (고도 기반)
+        self.freefall_altitude_drop = 4.8  # 자유낙하 시 4m 하강
+        self.stabilization_duration = 2.0  # 자유낙하 후 안정화 시간 2초
         
         self.landing_marker_pose = None
         self.last_marker_detection_time = None
         self.precision_landing_start_altitude = None
         self.land_command_issued = False # land 명령 중복 전송 방지 플래그
         
-        # 자유낙하 기동을 위한 상태 변수
-        self.freefall_prep_start_time = None
-        self.freefall_start_time = None
+        # 자유낙하 기동을 위한 상태 변수 (고도 기반)
+        self.freefall_start_altitude = None  # 자유낙하 시작 고도
+        self.stabilization_start_time = None
+        
+        # 자유낙하 속도 체크 변수 수정 (WP7→WP8)
+        self.wp7_arrival_detected = False   # WP7 도착 감지
+        self.motors_disabled = False        # 모터 비활성화 여부
+        self.velocity_threshold = 0.5       # 속도 임계값 (m/s)
+        
+        # PX4 상태 모니터링 변수
+        self.is_offboard_enabled = False    # Offboard 모드 활성화 여부
+        self.is_armed = False               # ARM 상태
         
         # 마커 위치 구독자
         self.marker_detection_sub = self.create_subscription(
@@ -108,6 +122,25 @@ class WaypointMissionNode(BaseMissionNode):
              # 즉시 상태를 변경하지 않고, check_landed_on_vehicle에 의해 처리되도록 둡니다.
              pass
 
+    def _vehicle_control_mode_callback(self, msg: VehicleControlMode):
+        """Vehicle Control Mode 콜백 - Offboard 상태 및 ARM 상태 모니터링"""
+        self.is_offboard_enabled = msg.flag_control_offboard_enabled
+        self.is_armed = msg.flag_armed  # 더 정확한 ARM 상태 체크 (VehicleStatus보다 신뢰성 높음)
+        
+        # ARM 상태 변경 시 로그 출력
+        if hasattr(self, '_last_flag_armed') and self._last_flag_armed != msg.flag_armed:
+            self.get_logger().info(f"실제 ARM 상태 변경: {msg.flag_armed}")
+        self._last_flag_armed = msg.flag_armed
+        
+    def _vehicle_status_callback(self, msg: VehicleStatus):
+        """Vehicle Status 콜백 - 디버깅용 정보만 수집"""
+        # arming_state 값 디버깅 (참고용)
+        if msg.arming_state != getattr(self, '_last_arming_state', -1):
+            self.get_logger().info(f"VehicleStatus arming_state 변경: {msg.arming_state} (참고용)")
+            self._last_arming_state = msg.arming_state
+        
+        # ARM 상태는 VehicleControlMode의 flag_armed를 사용함 (더 정확함)
+        
     def _marker_detection_callback(self, msg: Detection3DArray):
         """마커 탐지 토픽 콜백 함수"""
         if not msg.detections:
@@ -153,12 +186,8 @@ class WaypointMissionNode(BaseMissionNode):
                 self.emergency_land()
         
         elif command == 'start_freefall':
-            if self.state == "AWAITING_FREEFALL_COMMAND":
-                self.get_logger().info("자유낙하 시작 명령 수신!")
-                self.state = "PREPARING_FREEFALL"
-                self.freefall_prep_start_time = self.get_clock().now()
-            else:
-                self.get_logger().warn(f"자유낙하를 시작할 수 없는 상태: {self.state}")
+            # 더 이상 외부 명령으로 자유낙하를 시작하지 않음 (자동 처리)
+            self.get_logger().info("자유낙하는 WP8 도착 시 자동으로 실행됩니다.")
 
         elif command == 'start_precision_landing':
             if self.state == "AWAITING_LANDING_COMMAND":
@@ -322,6 +351,11 @@ class WaypointMissionNode(BaseMissionNode):
         # 시각화 마커 퍼블리시
         self._publish_mission_visuals()
         
+        # 상태별 Offboard Control Mode 발행 (FREEFALLING은 내부에서 처리, 나머지는 base에서 처리)
+        # Position 모드 전환 방지를 위해 ARMED_IDLE에서도 Offboard 신호 전송
+        if self.state not in ["LANDING", "LANDED", "INIT", "DISARMED", "FREEFALLING", "HANDSHAKE", "STABILIZING"]:
+            dcu.publish_offboard_control_mode(self)
+        
         # 미션별 상태 처리
         if self.state == "ARMED_IDLE":
             # 자동 미션이므로 ARMED_IDLE 상태에서 자동으로 이륙 시작
@@ -332,12 +366,10 @@ class WaypointMissionNode(BaseMissionNode):
             self._handle_takeoff_state()
         elif self.state == "MOVING_TO_WAYPOINT":
             self._handle_moving_to_waypoint_state()
-        elif self.state == "AWAITING_FREEFALL_COMMAND":
-            self._handle_awaiting_freefall_command_state()
-        elif self.state == "PREPARING_FREEFALL":
-            self._handle_preparing_freefall_state()
         elif self.state == "FREEFALLING":
             self._handle_freefall_state()
+        elif self.state == "STABILIZING":
+            self._handle_stabilizing_state()
         elif self.state == "AWAITING_LANDING_COMMAND":
             self._handle_awaiting_landing_command_state()
         elif self.state == "PRECISION_LANDING":
@@ -350,7 +382,7 @@ class WaypointMissionNode(BaseMissionNode):
     def _handle_takeoff_state(self):
         """이륙 상태 처리"""
         if self.current_map_pose:
-            takeoff_altitude = 5.0
+            takeoff_altitude = 5.5
             target_pos = [
                 self.current_map_pose.pose.position.x,
                 self.current_map_pose.pose.position.y,
@@ -377,6 +409,44 @@ class WaypointMissionNode(BaseMissionNode):
         target_stare_idx = self.stare_indices[target_wp_index]
         target_stare_pos = self.stare_targets[target_stare_idx]
         
+        # WP7 도착 후 속도 체크 로직
+        if self.wp7_arrival_detected and target_wp_index == 7:
+            # 드론의 XYZ 속도 체크
+            if self.current_local_pos:
+                # NED 좌표계에서 속도 벡터 크기 계산
+                vx = self.current_local_pos.vx
+                vy = self.current_local_pos.vy
+                vz = self.current_local_pos.vz
+                total_velocity = math.sqrt(vx*vx + vy*vy + vz*vz)
+                
+                self.get_logger().info(f"WP7 속도 체크: {total_velocity:.2f} m/s (임계값: {self.velocity_threshold} m/s)", 
+                                     throttle_duration_sec=0.3)
+                
+                if total_velocity <= self.velocity_threshold:
+                    # Offboard 모드 및 ARM 상태 확인
+                    if self.is_offboard_enabled and self.is_armed:
+                        self.get_logger().info("속도가 임계값 이하로 감소! 자유낙하 시작!")
+                        # WP7에서 자유낙하 시작 시 미션 완료 신호 전송
+                        self.send_mission_complete(6) # DRONE_WP8_ARRIVAL (자유낙하 시작 신호)
+                        self.state = "FREEFALLING"
+                        # 자유낙하 시작 고도 기록
+                        if self.current_map_pose:
+                            self.freefall_start_altitude = self.current_map_pose.pose.position.z
+                        self.motors_disabled = False  # 플래그 초기화
+                        return
+                    else:
+                        arming_state_val = getattr(self, '_last_arming_state', 'Unknown')
+                        self.get_logger().warn(f"자유낙하 조건 미충족: Offboard={self.is_offboard_enabled}, Armed={self.is_armed} (arming_state={arming_state_val}) - 2이면 Armed, 1이면 Disarmed")
+                        # 조건이 맞지 않으면 계속 호버링
+                        self.publish_waypoint_setpoint(target_wp_index)
+                        self.point_gimbal_at_target(target_stare_pos)
+                        return
+            
+            # 속도가 아직 높으면 현재 위치에서 호버링 유지
+            self.publish_waypoint_setpoint(target_wp_index)
+            self.point_gimbal_at_target(target_stare_pos)
+            return
+        
         # 웨이포인트로 이동 (위치 + yaw 제어)
         self.publish_waypoint_setpoint(target_wp_index)
         
@@ -385,11 +455,12 @@ class WaypointMissionNode(BaseMissionNode):
 
         # 도착 확인
         if self.check_arrival(target_wp.tolist(), tolerance=3.5):
-            # WP8에 도착한 경우, 자유낙하 명령 대기 상태로 전환
-            if target_wp_index == 8:
-                self.get_logger().info(f"웨이포인트 {target_wp_index} 도착. 자유낙하 명령 대기 중...")
-                self.state = "AWAITING_FREEFALL_COMMAND"
-                self.send_mission_complete(6) # DRONE_WP8_ARRIVAL
+            # WP7에 도착한 경우, 속도가 0.5m/s 이하가 될 때까지 대기
+            if target_wp_index == 7:
+                self.get_logger().info(f"웨이포인트 {target_wp_index} 도착. 속도 체크 시작!")
+                self.wp7_arrival_detected = True
+                # WP7 도착 시에는 미션 완료 신호를 보내지 않음 (자유낙하 시작 시 전송)
+                # 상태는 MOVING_TO_WAYPOINT를 유지하여 속도 체크 로직 실행
                 return
             
             self.get_logger().info(f"웨이포인트 {target_wp_index} 통과.")
@@ -404,26 +475,35 @@ class WaypointMissionNode(BaseMissionNode):
                 # 다음 웨이포인트로 계속 진행 (상태는 MOVING_TO_WAYPOINT 유지)
                 self.get_logger().info(f"다음 웨이포인트로 이동: {self.current_waypoint_index}")
     
-    def _handle_awaiting_freefall_command_state(self):
-        """자유낙하 명령 대기 상태. WP8 위치에서 호버링"""
-        # WP8 위치에서 호버링
-        self.publish_waypoint_setpoint(8)
-        self.get_logger().info("WP8에서 호버링하며 자유낙하 명령 대기중...", throttle_duration_sec=5.0)
-
-    def _handle_preparing_freefall_state(self):
-        """자유낙하 준비 상태. WP8 위치에서 5초간 호버링"""
-        # WP8 위치에서 호버링
-        self.publish_waypoint_setpoint(8)
+    def _handle_stabilizing_state(self):
+        """자유낙하 후 안정화 상태. 모터를 강제로 켜고 현재 위치에서 호버링"""
+        # 모터 강제 재활성화 및 Offboard Control Mode 발행
+        dcu.publish_offboard_control_mode(self)
         
-        duration_sec = (self.get_clock().now() - self.freefall_prep_start_time).nanoseconds / 1e9
-        if duration_sec > 5.0:
-            self.get_logger().info(f"자유낙하 시작! {self.freefall_duration:.2f}초 동안 모터 정지.")
-            self.state = "FREEFALLING"
-            self.freefall_start_time = self.get_clock().now()
+        # 현재 위치에서 호버링
+        if self.current_map_pose:
+            current_pos = [
+                self.current_map_pose.pose.position.x,
+                self.current_map_pose.pose.position.y,
+                self.current_map_pose.pose.position.z
+            ]
+            self.publish_position_setpoint(current_pos)
+        
+        # 안정화 시간 확인
+        elapsed_time = (self.get_clock().now() - self.stabilization_start_time).nanoseconds / 1e9
+        self.get_logger().info(f"자유낙하 후 안정화 중... ({elapsed_time:.1f}/2.0s)", 
+                              throttle_duration_sec=0.5)
+        
+        if elapsed_time >= self.stabilization_duration:
+            self.get_logger().info("안정화 완료. WP8로 이동합니다.")
+            self.current_waypoint_index = 8  # 다음 목표는 WP8 (WP7에서 자유낙하했으므로)
+            self.wp7_arrival_detected = False  # 플래그 리셋
+            self.freefall_start_altitude = None  # 자유낙하 고도 리셋
+            self.state = "MOVING_TO_WAYPOINT"
 
     def _handle_freefall_state(self):
-        """자유낙하 기동 상태. 정해진 시간 동안 모터 정지"""
-        # 1. 액추에이터 직접 제어 모드 활성화 및 모터 정지
+        """자유낙하 기동 상태. 모터를 강제로 끄고 4m 하강 후 다시 켜기"""
+        # Offboard failsafe 방지를 위해 지속적으로 offboard control mode 전송
         dcu.publish_offboard_control_mode(self, 
                                           position=False, 
                                           velocity=False, 
@@ -432,17 +512,30 @@ class WaypointMissionNode(BaseMissionNode):
                                           body_rate=False,
                                           thrust_and_torque=False,
                                           actuator=True)
+        
+        # 모터가 아직 꺼지지 않았다면 강제로 끄기
+        if not self.motors_disabled:
+            self.get_logger().info("모터 강제 비활성화! 자유낙하 시작")
+            self.motors_disabled = True
+
+        # 모터 정지 명령 지속적 전송 (failsafe 방지)
         dcu.publish_actuator_motors(self, [0.0, 0.0, 0.0, 0.0])
 
-        # 2. 시간 확인
-        elapsed_time = (self.get_clock().now() - self.freefall_start_time).nanoseconds / 1e9
-        
-        self.get_logger().info(f"자유낙하 중... ({elapsed_time:.2f}/{self.freefall_duration:.2f}s)", throttle_duration_sec=0.2)
-        
-        if elapsed_time >= self.freefall_duration:
-            self.get_logger().info("자유낙하 완료. 위치 제어 모드로 전환하여 WP9로 이동합니다.")
-            self.current_waypoint_index = 9  # 다음 목표는 WP9
-            self.state = "MOVING_TO_WAYPOINT"
+        # 고도 확인 (4.8m 하강 시 모터 재활성화)
+        if self.current_map_pose and self.freefall_start_altitude is not None:
+            current_altitude = self.current_map_pose.pose.position.z
+            altitude_dropped = self.freefall_start_altitude - current_altitude
+            
+            self.get_logger().info(f"자유낙하 중... (하강: {altitude_dropped:.2f}m / 목표: {self.freefall_altitude_drop}m) | Offboard: {self.is_offboard_enabled}", 
+                                 throttle_duration_sec=0.2)
+            
+            if altitude_dropped >= self.freefall_altitude_drop:
+                self.get_logger().info(f"자유낙하 완료 ({altitude_dropped:.2f}m 하강). 모터 강제 재활성화 후 안정화 모드로 전환")
+                self.state = "STABILIZING"
+                self.stabilization_start_time = self.get_clock().now()
+                self.motors_disabled = False  # 모터 다시 활성화 표시
+        else:
+            self.get_logger().warn("고도 정보가 없어 자유낙하를 정상적으로 처리할 수 없습니다.", throttle_duration_sec=1.0)
 
     def _handle_awaiting_landing_command_state(self):
         """착륙 명령 대기 상태 처리"""

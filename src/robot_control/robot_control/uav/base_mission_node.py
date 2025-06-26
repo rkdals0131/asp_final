@@ -112,7 +112,9 @@ class BaseMissionNode(Node, ABC):
         
         # 핸드셰이크 관련 변수
         self.handshake_counter = 0
-        self.handshake_duration = 15
+        self.handshake_duration = 50  # 50 카운트 = 0.5초 (100Hz * 50 = 0.5s)
+        self.offboard_ready = False
+        self.arm_ready = False
         
         # 공통 미션 데이터
         self._setup_mission_data()
@@ -128,15 +130,15 @@ class BaseMissionNode(Node, ABC):
         # yaw는 맵 좌표계 기준 (X축이 0도, 반시계방향이 양수)
         self.mission_definition = [
             (-95, 80, 17, 315, 0),  
-            (-77, 80, 31, 300, 1),  
-            (-63, 75, 25, 180, 2),  
-            (-55, 72, 15, 180, 3),  
-            (-70, 105, 12, 160, 4),  
-            (-90, 100, 17, 170, 5),  
-            (-93, 96, 22, 170, 6),  
-            (-100, 95, 30, 170, 7),  
-            (-63, 100, 27, 270, 8),
-            (-63, 100, 5, 270, 9),  
+            (-77.5, 80, 31.5, 300, 1),  
+            (-59, 73.5, 20, 180, 2),    
+            (-70, 105, 15.5, 160, 3),  
+            (-90, 100, 17, 170, 4),  
+            (-93, 96, 22.5, 170, 5),  
+            (-100.5, 95, 30.5, 170, 6),  
+            (-58, 105, 26, 270, 7),
+            (-58.6811, 105.322, 5, 151.43, 8), 
+            (-58.6811, 105.322, 2.29868, 151.43, 8),  
         ]
         
         # 드론 웨이포인트 (x, y, z 좌표만 추출)
@@ -152,14 +154,13 @@ class BaseMissionNode(Node, ABC):
         self.stare_targets = [
             [-94.4088, 68.4708, 3.8531],    
             [-75.4421, 74.9961, 23.2347],   
-            [-75.0, 75.0, 20.0],             
-            [-75.0, 75.0, 10.0],             
+            [-75.0, 75.0, 15.0],                      
             [-82.7931, 113.4203, 3.8079],   
             [-97.9238, 105.2799, 8.5504],   
             [-109.0, 100.0, 19.0],           
             [-109.1330, 100.3533, 23.1363], 
             [-62.9630, 99.0915, 0.1349],
-            [-62.9630, 99.0915, 0.1349]     
+            [-58.6811, 105.322, 2.29868]     
         ]
         
         # 최종 목적지 (편의를 위한 별칭)
@@ -240,9 +241,8 @@ class BaseMissionNode(Node, ABC):
             self.run_mission_logic()
             return
         
-        # Offboard 제어 모드 퍼블리시 (특정 상태 제외)
-        if self.state not in ["LANDING", "LANDED", "INIT", "DISARMED"]:
-            dcu.publish_offboard_control_mode(self)
+        # Offboard 제어 모드는 미션별 로직에서 개별적으로 처리
+        # (각 상태별로 적절한 제어 모드를 설정하도록 함)
         
         # 공통 상태 처리
         self._handle_common_states()
@@ -257,6 +257,9 @@ class BaseMissionNode(Node, ABC):
             self.get_logger().info("시스템 준비 완료. 미션 시작을 기다리는 중...", once=True)
             
         elif self.state == "HANDSHAKE":
+            # 1단계: Offboard Control Mode와 TrajectorySetpoint를 충분히 발행 (1초간)
+            dcu.publish_offboard_control_mode(self)
+            
             # 현재 위치 유지하면서 핸드셰이크
             if self.current_local_pos:
                 sp_msg = TrajectorySetpoint(
@@ -265,15 +268,29 @@ class BaseMissionNode(Node, ABC):
                 )
                 self.trajectory_setpoint_publisher.publish(sp_msg)
             
-            # ARM 및 Offboard 모드 설정
-            dcu.arm_and_offboard(self)
-            
             self.handshake_counter += 1
-            if self.handshake_counter > self.handshake_duration:
+            
+            # 0.2초 후 Offboard 모드 설정 (20 카운트)
+            if self.handshake_counter == 20 and not self.offboard_ready:
+                self.get_logger().info("Offboard 신호 준비 완료. Offboard 모드 설정 중...")
+                dcu.publish_vehicle_command(self, VehicleCommand.VEHICLE_CMD_DO_SET_MODE, param1=1.0, param2=6.0)
+                self.offboard_ready = True
+            
+            # 0.3초 후 ARM 명령 (30 카운트)
+            if self.handshake_counter == 30 and not self.arm_ready:
+                self.get_logger().info("ARM 명령 전송 중...")
+                dcu.publish_vehicle_command(self, VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM, param1=1.0)
+                self.arm_ready = True
+            
+            # 0.5초 후 완료 (50 카운트)
+            if self.handshake_counter >= self.handshake_duration:
                 self.get_logger().info("핸드셰이크 완료. ARM 및 Offboard 모드 활성화")
                 self.state = "ARMED_IDLE"
                 
         elif self.state == "ARMED_IDLE":
+            # Offboard Control Mode 발행
+            dcu.publish_offboard_control_mode(self)
+            
             # 현재 위치에서 대기
             if self.current_local_pos:
                 sp_msg = TrajectorySetpoint(
@@ -348,6 +365,10 @@ class BaseMissionNode(Node, ABC):
         """미션을 시작 (INIT → HANDSHAKE)"""
         if self.state == "INIT":
             self.get_logger().info("미션 시작!")
+            # 핸드셰이크 관련 변수 초기화
+            self.handshake_counter = 0
+            self.offboard_ready = False
+            self.arm_ready = False
             self.state = "HANDSHAKE"
         else:
             self.get_logger().warn(f"미션을 시작할 수 없음. 현재 상태: {self.state}")
