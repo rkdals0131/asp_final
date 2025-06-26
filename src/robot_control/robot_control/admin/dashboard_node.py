@@ -7,7 +7,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPo
 from rcl_interfaces.msg import ParameterDescriptor
 
 # 메시지 타입 임포트
-from px4_msgs.msg import VehicleLocalPosition
+from px4_msgs.msg import VehicleLocalPosition, VehicleStatus, VehicleControlMode
 from nav_msgs.msg import Odometry
 from std_msgs.msg import String
 from sensor_msgs.msg import Image
@@ -91,6 +91,8 @@ class UAVDashboard(Node):
         # 데이터 저장을 위한 멤버 변수
         self.drone_local_pos = None     # GPS 기준점(ref) 및 속도 정보용
         self.vehicle_odom = None        # 차량 속도 정보용
+        self.vehicle_status = None      # PX4 ARM 상태
+        self.vehicle_control_mode = None # PX4 제어 모드 상태
         self.detected_markers = {}      # 마커 ID별로 정보 저장: {id: {'pose': pose, 'stamp': stamp}}
         for i in range(11):  # 0 to 10
             self.detected_markers[i] = {
@@ -106,6 +108,9 @@ class UAVDashboard(Node):
         # 미션 상태 변수 (단순히 받아서 표시만)
         self.mission_status_raw = "INIT"  # 원본 상태 문자열
         self.mission_elapsed_time = 0.0
+        
+        # 시스템 초기화 상태 추적
+        self.system_ready = False
 
         # Pre-flight Check를 위한 변수
         self.topic_last_seen = {
@@ -115,6 +120,17 @@ class UAVDashboard(Node):
             'MISSION_STATUS': 0.0,
             'DRONE_STATE': 0.0,
             'VEHICLE_STATE': 0.0,
+            'VEHICLE_STATUS': 0.0,
+            'CONTROL_MODE': 0.0,
+        }
+        
+        # 토픽 수신 카운터 (2번 이상 받아야 GO)
+        self.topic_count = {
+            'PX4_LOC_POS': 0,
+            'VEHICLE_ODOM': 0,
+            'CAMERA_IMG': 0,
+            'VEHICLE_STATUS': 0,
+            'CONTROL_MODE': 0,
         }
         self.tf_status = False
         
@@ -151,11 +167,16 @@ class UAVDashboard(Node):
         self.create_subscription(String, self.drone_state_topic, self.drone_state_callback, qos_reliable)
         self.create_subscription(String, self.vehicle_state_topic, self.vehicle_state_callback, qos_reliable)
         self.create_subscription(String, self.mission_status_topic, self.mission_status_callback, qos_reliable)
+        
+        # PX4 상태 모니터링을 위한 추가 구독자
+        self.create_subscription(VehicleStatus, "/fmu/out/vehicle_status", self.vehicle_status_callback, qos_best_effort)
+        self.create_subscription(VehicleControlMode, "/fmu/out/vehicle_control_mode", self.vehicle_control_mode_callback, qos_best_effort)
 
         # 30Hz 업데이트 타이머
         self.timer = self.create_timer(1.0 / 30.0, self.update_dashboard)
         
-        self.get_logger().info("UAV Telemetry Dashboard v3.0 초기화 완료 - 순수 시각화 모드")
+        # 초기 화면 바로 표시
+        self.draw_loading_screen()
 
     # 콜백 함수들
     def get_current_time_sec(self):
@@ -164,13 +185,16 @@ class UAVDashboard(Node):
     def drone_local_pos_callback(self, msg: VehicleLocalPosition):
         self.drone_local_pos = msg
         self.topic_last_seen['PX4_LOC_POS'] = self.get_current_time_sec()
+        self.topic_count['PX4_LOC_POS'] += 1
 
     def vehicle_odometry_callback(self, msg: Odometry):
         self.vehicle_odom = msg
         self.topic_last_seen['VEHICLE_ODOM'] = self.get_current_time_sec()
+        self.topic_count['VEHICLE_ODOM'] += 1
         
     def camera_image_callback(self, msg: Image):
         self.topic_last_seen['CAMERA_IMG'] = self.get_current_time_sec()
+        self.topic_count['CAMERA_IMG'] += 1
 
     def marker_detection_callback(self, msg: Detection3DArray):
         # 모든 마커를 '감지되지 않음'으로 초기화
@@ -218,6 +242,23 @@ class UAVDashboard(Node):
             self.mission_status_raw = msg.data
             self.mission_elapsed_time = 0.0
 
+    def vehicle_status_callback(self, msg: VehicleStatus):
+        """PX4 Vehicle Status 콜백 - ARM 상태 모니터링"""
+        self.vehicle_status = msg
+        self.topic_last_seen['VEHICLE_STATUS'] = self.get_current_time_sec()
+        self.topic_count['VEHICLE_STATUS'] += 1
+        
+        # arming_state 값 디버깅
+        if msg.arming_state != getattr(self, '_last_arming_state', -1):
+            self.get_logger().info(f"Dashboard - Arming State 변경: {msg.arming_state}")
+            self._last_arming_state = msg.arming_state
+
+    def vehicle_control_mode_callback(self, msg: VehicleControlMode):
+        """PX4 Vehicle Control Mode 콜백 - 제어 모드 모니터링"""
+        self.vehicle_control_mode = msg
+        self.topic_last_seen['CONTROL_MODE'] = self.get_current_time_sec()
+        self.topic_count['CONTROL_MODE'] += 1
+
     # 데이터 처리 및 포맷팅
     def update_tf_poses(self):
         """TF Listener를 사용하여 드론과 차량의 월드 좌표를 업데이트"""
@@ -226,7 +267,7 @@ class UAVDashboard(Node):
             full_drone_frame_id = f"{self.drone_frame_id}/base_link"
             trans_drone = self.tf_buffer.lookup_transform(self.map_frame, full_drone_frame_id, rclpy.time.Time())
             self.drone_world_pos = trans_drone.transform.translation
-        except TransformException:
+        except (TransformException, Exception):
             self.drone_world_pos = None
 
         try:
@@ -234,7 +275,7 @@ class UAVDashboard(Node):
             full_vehicle_frame_id = f"{self.vehicle_frame_id}/base_link"
             trans_vehicle = self.tf_buffer.lookup_transform(self.map_frame, full_vehicle_frame_id, rclpy.time.Time())
             self.vehicle_world_pos = trans_vehicle.transform.translation
-        except TransformException:
+        except (TransformException, Exception):
             self.vehicle_world_pos = None
 
     def enu_to_gps(self, x, y, z, ref_lat, ref_lon, ref_alt):
@@ -292,6 +333,42 @@ class UAVDashboard(Node):
             elif node_name == 'offboard_control':
                 self.node_status[node_name] = (now - self.topic_last_seen['DRONE_STATE']) < self.node_timeout
 
+    def draw_loading_screen(self):
+        """시스템 준비 전 대기화면을 ASCII 아트로 표시"""
+        os.system('clear')
+        
+        # ASCII 아트 - KONKUK
+        konkuk_art = [
+            "██   ██  ██████  ███    ██ ██   ██ ██    ██ ██   ██",
+            "██  ██  ██    ██ ████   ██ ██  ██  ██    ██ ██  ██ ",
+            "█████   ██    ██ ██ ██  ██ █████   ██    ██ █████  ",
+            "██  ██  ██    ██ ██  ██ ██ ██  ██  ██    ██ ██  ██ ",
+            "██   ██  ██████  ██   ████ ██   ██  ██████  ██   ██"
+        ]
+        
+        print(f"{self.COLOR_BOLD}{'='*70}{self.COLOR_END}")
+        print()
+        
+        # KONKUK 출력 (중앙 정렬)
+        for line in konkuk_art:
+            print(f"{self.COLOR_CYAN}{line:^70}{self.COLOR_END}")
+        
+        print()
+        print()
+        
+        # SMART VEHICLE ENGINEERING 출력 (일반 대문자)
+        subtitle = "SMART VEHICLE ENGINEERING"
+        print(f"{self.COLOR_YELLOW}{subtitle:^70}{self.COLOR_END}")
+        
+        print()
+        print()
+        
+        # 로딩 상태 표시
+        print(f"{self.COLOR_BOLD}{'시스템 초기화 중...':^70}{self.COLOR_END}")
+        
+        print()
+        print(f"{self.COLOR_BOLD}{'='*70}{self.COLOR_END}")
+
     # 메인 업데이트 루프
     def update_dashboard(self):
         # 1. TF 정보 업데이트
@@ -301,11 +378,25 @@ class UAVDashboard(Node):
         # 2. 노드 건강 상태 체크
         self.check_node_health()
 
-        # 3. Pre-flight Check
+        # 3. Pre-flight Check (2번 이상 수신되어야 GO)
         now = self.get_current_time_sec()
-        px4_ok = (now - self.topic_last_seen['PX4_LOC_POS']) < self.check_timeout
-        vehicle_odom_ok = (now - self.topic_last_seen['VEHICLE_ODOM']) < self.check_timeout
-        camera_ok = (now - self.topic_last_seen['CAMERA_IMG']) < self.check_timeout
+        px4_ok = (now - self.topic_last_seen['PX4_LOC_POS']) < self.check_timeout and self.topic_count['PX4_LOC_POS'] >= 2
+        vehicle_odom_ok = (now - self.topic_last_seen['VEHICLE_ODOM']) < self.check_timeout and self.topic_count['VEHICLE_ODOM'] >= 2
+        camera_ok = (now - self.topic_last_seen['CAMERA_IMG']) < self.check_timeout and self.topic_count['CAMERA_IMG'] >= 2
+        
+        # PX4 상태 체크
+        vehicle_status_ok = (now - self.topic_last_seen['VEHICLE_STATUS']) < self.check_timeout and self.topic_count['VEHICLE_STATUS'] >= 1
+        control_mode_ok = (now - self.topic_last_seen['CONTROL_MODE']) < self.check_timeout and self.topic_count['CONTROL_MODE'] >= 1
+        
+        # ARM 상태 체크 - VehicleControlMode의 flag_armed 사용 (더 정확함)
+        is_armed = False
+        if self.vehicle_control_mode:
+            is_armed = self.vehicle_control_mode.flag_armed
+            
+        # 제어 모드 체크 (Offboard 활성화 여부)
+        is_offboard = False
+        if self.vehicle_control_mode:
+            is_offboard = self.vehicle_control_mode.flag_control_offboard_enabled
         
         # 미션 컨트롤 시스템 전체 상태
         mission_control_ok = all(self.node_status.values())
@@ -313,9 +404,20 @@ class UAVDashboard(Node):
         # 전체 시스템 준비 상태
         hardware_ready = all([px4_ok, vehicle_odom_ok, camera_ok, self.tf_status])
         software_ready = mission_control_ok
-        all_systems_go = hardware_ready and software_ready
-
-        # 4. 화면 클리어 및 대시보드 그리기
+        px4_status_ready = all([vehicle_status_ok, control_mode_ok])
+        all_systems_go = hardware_ready and software_ready and px4_status_ready
+        
+        # 시스템 준비 상태 확인 - 핵심 컴포넌트 중 하나라도 활성화되면 메인화면으로
+        basic_ready = px4_ok or vehicle_odom_ok or self.tf_status
+        if not self.system_ready and basic_ready:
+            self.system_ready = True
+            
+        # 4. 화면 표시 분기
+        if not self.system_ready:
+            self.draw_loading_screen()
+            return
+            
+        # 5. 메인 대시보드 그리기
         os.system('clear')
         
         # 섹션 1 & 2: 시스템 상태와 미션 상태를 좌우로 나란히 표시
@@ -343,7 +445,9 @@ class UAVDashboard(Node):
             f"  PX4:     [{self.COLOR_GREEN}GO{self.COLOR_END}]" if px4_ok else f"  PX4:     [{self.COLOR_RED}NO-GO{self.COLOR_END}]",
             f"  UGV ODO: [{self.COLOR_GREEN}GO{self.COLOR_END}]" if vehicle_odom_ok else f"  UGV ODO: [{self.COLOR_RED}NO-GO{self.COLOR_END}]",
             f"  CAM:     [{self.COLOR_GREEN}GO{self.COLOR_END}]" if camera_ok else f"  CAM:     [{self.COLOR_RED}NO-GO{self.COLOR_END}]",
-            f"  TF :     [{self.COLOR_GREEN}GO{self.COLOR_END}]" if self.tf_status else f"  TF :     [{self.COLOR_RED}NO-GO{self.COLOR_END}]"
+            f"  TF :     [{self.COLOR_GREEN}GO{self.COLOR_END}]" if self.tf_status else f"  TF :     [{self.COLOR_RED}NO-GO{self.COLOR_END}]",
+            f"  ARM:     [{self.COLOR_GREEN}GO{self.COLOR_END}]" if is_armed else f"  ARM:     [{self.COLOR_RED}NO-GO{self.COLOR_END}]",
+            f"  OFBD_DR: [{self.COLOR_GREEN}GO{self.COLOR_END}]" if is_offboard else f"  OFBD_DR: [{self.COLOR_RED}NO-GO{self.COLOR_END}]"
         ]
 
         sw_status_lines = []

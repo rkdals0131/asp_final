@@ -33,10 +33,10 @@ class PathFollowerNode(Node):
     def __init__(self):
         super().__init__('path_follower_node')
 
-        # === 핵심 파라미터 ===
-        self.declare_parameter('max_jerk_with_drone', 2.0)
+        # === 핵심 파라미터 (하드코딩된 기본값) ===
+        self.declare_parameter('max_jerk_with_drone', 1.0)
         self.declare_parameter('max_jerk_default', 4.0)
-        self.declare_parameter('max_accel_with_drone', 1.0)
+        self.declare_parameter('max_accel_with_drone', 0.9)
         self.declare_parameter('max_accel_default', 4.0)
 
         self.declare_parameter('lookahead_k', 0.9)
@@ -45,14 +45,18 @@ class PathFollowerNode(Node):
         self.declare_parameter('max_speed', 7.0)
         self.declare_parameter('min_speed', 0.5)
         self.declare_parameter('max_decel', 1.0)
-        self.declare_parameter('max_lateral_accel', 2.0)
+        self.declare_parameter('max_lateral_accel', 2.5)
         self.declare_parameter('waypoint_reach_threshold', 1.5)
         self.declare_parameter('path_density', 0.1)
         self.declare_parameter('map_frame', 'map')
         self.declare_parameter('vehicle_base_frame', 'X1_asp')
         
-        # === 경로 로딩 파라미터 ===
-        self.declare_parameter('waypoint_file', '')
+        # === 경로 로딩 파라미터 (하드코딩된 기본값) ===
+        # 패키지 루트 디렉토리 계산
+        package_root = os.path.join(os.path.dirname(__file__), '..', '..')
+        default_waypoint_file = os.path.join(package_root, 'config', 'ugv_wp.csv')
+        
+        self.declare_parameter('waypoint_file', default_waypoint_file)
         self.declare_parameter('use_mission_ids', True)
 
         # 파라미터 로딩
@@ -116,8 +120,9 @@ class PathFollowerNode(Node):
 
         # === 미션 완료 신호 매핑 ===
         self.waypoint_mission_mapping = {
-            2: 1,
-            len(self.raw_waypoints) - 1: 3
+            1: 1,  # mission_type 1 도달 시 드론 ARM 신호
+            2: 2,  # mission_type 2 도달 시 드론 takeoff 신호
+            len(self.raw_waypoints) - 1: 3  # UGV 미션 완료
         }
 
         # TF 및 통신
@@ -298,18 +303,22 @@ class PathFollowerNode(Node):
         self.current_max_jerk = self.MAX_JERK_DEFAULT
         self.velocity_profiler.update_dynamic_limits(self.current_max_accel, self.current_max_jerk)
 
-        remaining_waypoints = self.raw_waypoints[self.current_waypoint_idx:]
-        if not remaining_waypoints:
+        # 남은 웨이포인트가 있는지 확인
+        if self.current_waypoint_idx >= len(self.raw_waypoints):
             self.is_mission_complete = True
             self.get_logger().info("No more waypoints. Mission complete.")
             return
-            
-        self.main_path_points = self.path_planner.generate_path_from_waypoints(remaining_waypoints)
         
-        # <<< 수정됨 >>> 경로가 재생성되므로, 경로 탐색 시작 인덱스를 반드시 0으로 초기화해야 합니다.
-        self.last_closest_idx = 0
-        
-        self.update_full_path_and_velocity()
+        # 기존 경로를 유지하고, 현재 위치 기준으로 closest_idx만 업데이트
+        if self.full_path_points and self.vehicle_pose_map:
+            last_closest_idx_ref = [self.last_closest_idx]
+            self.pursuit_controller.find_closest_point_idx(
+                (self.vehicle_pose_map[0], self.vehicle_pose_map[1]),
+                self.full_path_points,
+                last_closest_idx_ref
+            )
+            self.last_closest_idx = last_closest_idx_ref[0]
+            self.get_logger().info(f"기존 경로 유지. 현재 closest_idx: {self.last_closest_idx}")
         
         self.is_mission_paused = False
         self.is_orienting = True
@@ -460,7 +469,9 @@ class PathFollowerNode(Node):
             
             if len(waypoint) > 2:
                 mission_type = waypoint[2]
-                if mission_type == 2:
+                if mission_type == 1:
+                    self.get_logger().info("드론 ARM 지점 도달. 드론 ARM 신호를 전송합니다.")
+                elif mission_type == 2:
                     self.is_mission_paused = True
                     self.get_logger().info("드론 이륙 지점 도달. 차량을 일시 정지합니다.")
                 elif mission_type == 4:
@@ -488,6 +499,7 @@ class PathFollowerNode(Node):
 
 def main(args=None):
     rclpy.init(args=args)
+    
     try:
         node = PathFollowerNode()
         rclpy.spin(node)

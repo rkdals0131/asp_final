@@ -66,13 +66,13 @@ class BaseMissionNode(Node, ABC):
             OffboardControlMode, "/fmu/in/offboard_control_mode", 10
         )
         self.trajectory_setpoint_publisher = self.create_publisher(
-            TrajectorySetpoint, "/fmu/in/trajectory_setpoint", self.qos_profile
+            TrajectorySetpoint, "/fmu/in/trajectory_setpoint", 10
         )
         self.attitude_setpoint_publisher = self.create_publisher(
-            VehicleAttitudeSetpoint, "/fmu/in/vehicle_attitude_setpoint", self.qos_profile
+            VehicleAttitudeSetpoint, "/fmu/in/vehicle_attitude_setpoint", 10
         )
         self.actuator_motors_publisher = self.create_publisher(
-            ActuatorMotors, "/fmu/in/actuator_motors", self.qos_profile
+            ActuatorMotors, "/fmu/in/actuator_motors", 10
         )
         self.vehicle_command_publisher = self.create_publisher(
             VehicleCommand, "/fmu/in/vehicle_command", 10
@@ -112,15 +112,13 @@ class BaseMissionNode(Node, ABC):
         
         # 핸드셰이크 관련 변수
         self.handshake_counter = 0
-        self.handshake_duration = 50  # 50 카운트 = 0.5초 (100Hz * 50 = 0.5s)
-        self.offboard_ready = False
-        self.arm_ready = False
+        self.handshake_duration = 15
         
         # 공통 미션 데이터
         self._setup_mission_data()
         
-        # 상태 머신 타이머 (100Hz)
-        self.mission_timer = self.create_timer(0.01, self.run_state_machine_wrapper)
+        # 상태 머신 타이머 (10Hz)
+        self.state_machine_timer = self.create_timer(0.1, self.run_state_machine_wrapper)
         
         self.get_logger().info(f"{node_name} initialized successfully.")
     
@@ -129,17 +127,16 @@ class BaseMissionNode(Node, ABC):
         # 미션 정의: (x, y, z, yaw, stare_index)
         # yaw는 맵 좌표계 기준 (X축이 0도, 반시계방향이 양수)
         self.mission_definition = [
-            (-95, 80, 17.5, 280, 0),  
-            (-74, 82, 31.5, 300, 1),  
-            (-59, 73.5, 20, 180, 2),    
-            (-70, 105, 15.5, 160, 3),  
-            (-90, 100, 17, 170, 4),  
-            (-93, 96, 22.5, 170, 5),  
-            (-100.5, 95, 30.5, 170, 6),  
-            (-58, 105, 26, 270, 7),
-            #(-58, 105, 6, 270, 8),
-            #(-58.6811, 105.322, 5, 151.43, 8), 
-            (-58.6811, 105.322, 2.29868, 151.43, 8),  
+            (-95, 80, 17, 315, 0),  
+            (-77, 80, 30, 300, 1),  
+            (-63, 75, 25, 180, 2),  
+            (-55, 72, 15, 180, 3),  
+            (-70, 100, 12, 160, 4),  
+            (-90, 100, 17, 170, 5),  
+            (-93, 96, 22, 170, 6),  
+            (-100, 95, 30, 170, 7),  
+            (-63, 100, 20, 270, 8),
+            (-63, 100, 6, 270, 9),  
         ]
         
         # 드론 웨이포인트 (x, y, z 좌표만 추출)
@@ -155,31 +152,18 @@ class BaseMissionNode(Node, ABC):
         self.stare_targets = [
             [-94.4088, 68.4708, 3.8531],    
             [-75.4421, 74.9961, 23.2347],   
-            [-75.0, 75.0, 15.0],                      
+            [-75.0, 75.0, 20.0],             
+            [-75.0, 75.0, 10.0],             
             [-82.7931, 113.4203, 3.8079],   
             [-97.9238, 105.2799, 8.5504],   
             [-109.0, 100.0, 19.0],           
             [-109.1330, 100.3533, 23.1363], 
             [-62.9630, 99.0915, 0.1349],
-            [-58.6811, 105.322, 2.29868]     
+            [-62.9630, 99.0915, 0.1349]     
         ]
         
         # 최종 목적지 (편의를 위한 별칭)
         self.final_destination = self.stare_targets[-1]
-        
-        # 특수 기동 웨이포인트 (fall, dive 등의 테스트용)
-        self.maneuver_waypoints = {
-            'freefall_test': [
-                [-95, 80, 25, 0, 'fall', 10],      # [x, y, z, yaw, maneuver_type, target_alt]
-                [-77, 80, 20, 0, 'fall', 8],
-                [-63, 75, 15, 0, 'fall', 5]
-            ],
-            'dive_test': [
-                [-95, 80, 25, 315, 'dive', 15, -30],  # [x, y, z, yaw, maneuver_type, target_alt, pitch]
-                [-77, 80, 20, 300, 'dive', 12, -45],
-                [-63, 75, 18, 180, 'dive', 8, -60]
-            ]
-        }
     
     # 공통 콜백 함수들
     
@@ -200,43 +184,28 @@ class BaseMissionNode(Node, ABC):
         Returns:
             bool: TF 조회 성공 여부
         """
-        # 시도할 프레임 ID 목록 (가장 일반적인 것부터 시도)
-        candidate_frames = [
-            f"{self.drone_frame_id}/base_link",
-            f"{self.drone_frame_id}",
-            "x500_gimbal_0/base_link", 
-            "x500_gimbal_0"
-        ]
-        
-        for frame_id in candidate_frames:
-            try:
-                trans = self.tf_buffer.lookup_transform('map', frame_id, rclpy.time.Time())
-                
-                if self.current_map_pose is None:
-                    self.current_map_pose = PoseStamped()
-                
-                self.current_map_pose.pose.position.x = trans.transform.translation.x
-                self.current_map_pose.pose.position.y = trans.transform.translation.y
-                self.current_map_pose.pose.position.z = trans.transform.translation.z
-                self.current_map_pose.pose.orientation = trans.transform.rotation
-                
-                # 성공적으로 찾은 프레임 ID를 업데이트
-                if hasattr(self, '_working_frame_id') and self._working_frame_id != frame_id:
-                    self.get_logger().info(f"TF 프레임 변경: {getattr(self, '_working_frame_id', 'unknown')} -> {frame_id}")
-                self._working_frame_id = frame_id
-                
-                return True
-                
-            except TransformException:
-                continue
-        
-        # 모든 후보 프레임에서 실패한 경우
-        if self.state != "INIT":
-            self.get_logger().warn(
-                f"모든 TF 프레임 조회 실패. 시도한 프레임: {candidate_frames}", 
-                throttle_duration_sec=2.0
-            )
-        return False
+        try:
+            # TF lookup용 완전한 프레임 ID 구성 (base_link 접미사 추가)
+            full_drone_frame_id = f"{self.drone_frame_id}/base_link"
+            trans = self.tf_buffer.lookup_transform('map', full_drone_frame_id, rclpy.time.Time())
+            
+            if self.current_map_pose is None:
+                self.current_map_pose = PoseStamped()
+            
+            self.current_map_pose.pose.position.x = trans.transform.translation.x
+            self.current_map_pose.pose.position.y = trans.transform.translation.y
+            self.current_map_pose.pose.position.z = trans.transform.translation.z
+            self.current_map_pose.pose.orientation = trans.transform.rotation
+            
+            return True
+            
+        except TransformException as e:
+            if self.state != "INIT":
+                self.get_logger().warn(
+                    f"TF lookup failed for '{full_drone_frame_id}': {e}", 
+                    throttle_duration_sec=1.0
+                )
+            return False
     
     # 상태 머신 관련 메서드
     
@@ -257,8 +226,9 @@ class BaseMissionNode(Node, ABC):
             self.run_mission_logic()
             return
         
-        # Offboard 제어 모드는 미션별 로직에서 개별적으로 처리
-        # (각 상태별로 적절한 제어 모드를 설정하도록 함)
+        # Offboard 제어 모드 퍼블리시 (특정 상태 제외)
+        if self.state not in ["LANDING", "LANDED", "INIT", "DISARMED"]:
+            dcu.publish_offboard_control_mode(self)
         
         # 공통 상태 처리
         self._handle_common_states()
@@ -273,9 +243,6 @@ class BaseMissionNode(Node, ABC):
             self.get_logger().info("시스템 준비 완료. 미션 시작을 기다리는 중...", once=True)
             
         elif self.state == "HANDSHAKE":
-            # 1단계: Offboard Control Mode와 TrajectorySetpoint를 충분히 발행 (1초간)
-            dcu.publish_offboard_control_mode(self)
-            
             # 현재 위치 유지하면서 핸드셰이크
             if self.current_local_pos:
                 sp_msg = TrajectorySetpoint(
@@ -284,29 +251,15 @@ class BaseMissionNode(Node, ABC):
                 )
                 self.trajectory_setpoint_publisher.publish(sp_msg)
             
+            # ARM 및 Offboard 모드 설정
+            dcu.arm_and_offboard(self)
+            
             self.handshake_counter += 1
-            
-            # 0.2초 후 Offboard 모드 설정 (20 카운트)
-            if self.handshake_counter == 20 and not self.offboard_ready:
-                self.get_logger().info("Offboard 신호 준비 완료. Offboard 모드 설정 중...")
-                dcu.publish_vehicle_command(self, VehicleCommand.VEHICLE_CMD_DO_SET_MODE, param1=1.0, param2=6.0)
-                self.offboard_ready = True
-            
-            # 0.3초 후 ARM 명령 (30 카운트)
-            if self.handshake_counter == 30 and not self.arm_ready:
-                self.get_logger().info("ARM 명령 전송 중...")
-                dcu.publish_vehicle_command(self, VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM, param1=1.0)
-                self.arm_ready = True
-            
-            # 0.5초 후 완료 (50 카운트)
-            if self.handshake_counter >= self.handshake_duration:
+            if self.handshake_counter > self.handshake_duration:
                 self.get_logger().info("핸드셰이크 완료. ARM 및 Offboard 모드 활성화")
                 self.state = "ARMED_IDLE"
                 
         elif self.state == "ARMED_IDLE":
-            # Offboard Control Mode 발행
-            dcu.publish_offboard_control_mode(self)
-            
             # 현재 위치에서 대기
             if self.current_local_pos:
                 sp_msg = TrajectorySetpoint(
@@ -381,12 +334,6 @@ class BaseMissionNode(Node, ABC):
         """미션을 시작 (INIT → HANDSHAKE)"""
         if self.state == "INIT":
             self.get_logger().info("미션 시작!")
-            # 핸드셰이크 관련 변수 초기화
-            self.handshake_counter = 0
-            self.offboard_ready = False
-            self.arm_ready = False
-            # Offboard 모드 즉시 활성화 시작
-            dcu.publish_offboard_control_mode(self)
             self.state = "HANDSHAKE"
         else:
             self.get_logger().warn(f"미션을 시작할 수 없음. 현재 상태: {self.state}")
@@ -510,6 +457,6 @@ class BaseMissionNode(Node, ABC):
     
     def destroy_node(self):
         """노드 종료 시 정리 작업"""
-        if hasattr(self, 'mission_timer'):
-            self.mission_timer.cancel()
+        if hasattr(self, 'state_machine_timer'):
+            self.state_machine_timer.cancel()
         super().destroy_node()
