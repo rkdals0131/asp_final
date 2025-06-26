@@ -34,7 +34,7 @@ class PathFollowerNode(Node):
         super().__init__('path_follower_node')
 
         # === 핵심 파라미터 (하드코딩된 기본값) ===
-        self.declare_parameter('max_jerk_with_drone', 2.0)
+        self.declare_parameter('max_jerk_with_drone', 1.0)
         self.declare_parameter('max_jerk_default', 4.0)
         self.declare_parameter('max_accel_with_drone', 0.9)
         self.declare_parameter('max_accel_default', 4.0)

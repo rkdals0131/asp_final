@@ -78,11 +78,11 @@ class WaypointMissionNode(BaseMissionNode):
         self.precision_horizontal_tolerance = self.get_parameter('precision_horizontal_tolerance').value
         
         # 자유낙하 파라미터 (고도 기반, 단계별)
-        self.freefall_altitude_drop = 2.0  # 총 낙하 거리
-        self.freefall_stage1_drop = 0.9    # 1단계: 0.0 추력으로 0.8m 하강
-        self.freefall_stage2_drop = 0.2    # 2단계: 0.1 추력으로 0.4m 하강  
-        self.freefall_stage3_drop = 0.9    # 3단계: 0.3 추력으로 0.8m 하강
-        self.stabilization_duration = 3.141592  # 안정화 시간 2.0초
+        self.freefall_altitude_drop = 4.2  # 총 낙하 거리
+        self.freefall_stage1_drop = 4.0   # 1단계: 0.0 추력으로 0.8m 하강
+        self.freefall_stage2_drop = 0.1    # 2단계: 0.1 추력으로 0.4m 하강  
+        self.freefall_stage3_drop = 0.1    # 3단계: 0.3 추력으로 0.8m 하강
+        self.stabilization_duration = 3.141592
         
         self.landing_marker_pose = None
         self.last_marker_detection_time = None
